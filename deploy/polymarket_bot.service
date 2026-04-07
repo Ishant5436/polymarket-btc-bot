@@ -1,0 +1,41 @@
+[Unit]
+Description=Polymarket BTC 5-Min Trading Bot
+Documentation=https://github.com/your-repo/btc-bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=deploy
+Group=deploy
+WorkingDirectory=/opt/btc-bot
+EnvironmentFile=/opt/btc-bot/.env
+
+# Run the trading engine
+ExecStart=/opt/btc-bot/venv/bin/python -m src.execution.engine
+
+# Restart policy
+Restart=always
+RestartSec=5
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=polymarket-bot
+
+# Security hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/opt/btc-bot/data /opt/btc-bot/logs
+PrivateTmp=yes
+
+# Environment
+Environment="LOG_LEVEL=INFO"
+Environment="LOG_JSON=true"
+Environment="PYTHONUNBUFFERED=1"
+
+[Install]
+WantedBy=multi-user.target
