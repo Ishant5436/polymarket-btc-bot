@@ -33,6 +33,8 @@ class RiskManager:
         client: PolymarketClient,
         read_only_mode: bool = False,
         sigma_threshold: Optional[float] = None,
+        min_absolute_volatility: Optional[float] = None,
+        min_relative_volatility_multiplier: Optional[float] = None,
         cooldown_seconds: Optional[int] = None,
         pnl_floor: Optional[float] = None,
         max_positions: Optional[int] = None,
@@ -44,6 +46,16 @@ class RiskManager:
             sigma_threshold
             if sigma_threshold is not None
             else RISK.volatility_sigma_threshold
+        )
+        self._min_absolute_volatility = (
+            min_absolute_volatility
+            if min_absolute_volatility is not None
+            else RISK.volatility_min_absolute_threshold
+        )
+        self._min_relative_volatility_multiplier = (
+            min_relative_volatility_multiplier
+            if min_relative_volatility_multiplier is not None
+            else RISK.volatility_min_relative_multiplier
         )
         self._cooldown_seconds = (
             cooldown_seconds
@@ -71,7 +83,9 @@ class RiskManager:
         self._trading_halted = False
 
         # Volatility baseline tracking
-        self._vol_history: deque[float] = deque(maxlen=1000)
+        self._vol_history: deque[float] = deque(
+            maxlen=max(30, RISK.vol_lookback_window)
+        )
         self._last_vol_sample_timestamp_ms: Optional[int] = None
 
         # Cache noisy private account reads for a short TTL.
@@ -130,29 +144,61 @@ class RiskManager:
         if current_vol <= 0:
             return False
 
+        baseline_samples = np.array(self._vol_history, dtype=np.float64)
+
         # Track volatility history
         self._vol_history.append(current_vol)
         self._last_vol_sample_timestamp_ms = latest_timestamp_ms
 
-        if len(self._vol_history) < 30:
+        if len(baseline_samples) < 30:
             return False  # Not enough history to establish baseline
 
         # Compute baseline statistics
-        vol_array = np.array(self._vol_history)
-        vol_mean = np.mean(vol_array)
-        vol_std = np.std(vol_array)
+        vol_mean = float(np.mean(baseline_samples))
+        vol_std = float(np.std(baseline_samples))
 
-        if vol_std < 1e-12:
+        if vol_mean <= 0 or vol_std < 1e-12:
             return False
 
         # Z-score of current volatility
         z_score = (current_vol - vol_mean) / vol_std
+        relative_multiplier = current_vol / vol_mean
 
         if z_score >= self._sigma_threshold:
+            if current_vol < self._min_absolute_volatility:
+                logger.debug(
+                    "Volatility spike ignored below absolute floor | current_vol=%.6f "
+                    "baseline_vol=%.6f z_score=%.2f abs_floor=%.6f",
+                    current_vol,
+                    vol_mean,
+                    z_score,
+                    self._min_absolute_volatility,
+                )
+                return False
+
+            if relative_multiplier < self._min_relative_volatility_multiplier:
+                logger.debug(
+                    "Volatility spike ignored below relative floor | current_vol=%.6f "
+                    "baseline_vol=%.6f rel_multiplier=%.2fx min_multiplier=%.2fx "
+                    "z_score=%.2f",
+                    current_vol,
+                    vol_mean,
+                    relative_multiplier,
+                    self._min_relative_volatility_multiplier,
+                    z_score,
+                )
+                return False
+
             logger.critical(
-                "VOLATILITY KILL-SWITCH TRIGGERED | "
-                "current_vol=%.6f z_score=%.2f threshold=%.1fσ",
-                current_vol, z_score, self._sigma_threshold,
+                "[KILL_SWITCH] VOLATILITY KILL-SWITCH TRIGGERED | "
+                "current_vol=%.6f baseline_vol=%.6f rel_multiplier=%.2fx "
+                "z_score=%.2f threshold=%.1fσ | trading paused for %d seconds",
+                current_vol,
+                vol_mean,
+                relative_multiplier,
+                z_score,
+                self._sigma_threshold,
+                self._cooldown_seconds,
             )
             self._trigger_kill_switch()
             return True

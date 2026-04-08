@@ -54,6 +54,8 @@ class BinanceRESTClient:
                     "volume",
                     "taker_buy_base",
                     "trades_count",
+                    "liq_long_notional",
+                    "liq_short_notional",
                 ]
             )
 
@@ -100,6 +102,8 @@ class BinanceRESTClient:
                     "volume",
                     "taker_buy_base",
                     "trades_count",
+                    "liq_long_notional",
+                    "liq_short_notional",
                 ]
             )
 
@@ -116,6 +120,8 @@ class BinanceRESTClient:
                 "trades_count",
             ]
         ].copy()
+        df["liq_long_notional"] = 0.0
+        df["liq_short_notional"] = 0.0
         df.drop_duplicates(subset=["open_time"], keep="last", inplace=True)
         df.sort_values("open_time", inplace=True)
         df.reset_index(drop=True, inplace=True)

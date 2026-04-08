@@ -29,8 +29,8 @@ from config.settings import PATHS
 from src.features.schema import FEATURE_COLUMNS, TARGET_COLUMN, TIMESTAMP_COLUMN
 from src.utils.experiment_tracking import ExperimentTracker
 from src.utils.model_metadata import (
+    get_model_target_horizon_minutes,
     load_training_metadata,
-    resolve_target_horizon_minutes,
     training_metadata_path_for_model,
 )
 
@@ -89,7 +89,7 @@ def main():
     model = lgb.Booster(model_file=model_path)
     training_metadata_path = training_metadata_path_for_model(model_path)
     training_metadata = load_training_metadata(model_path)
-    target_horizon_minutes = resolve_target_horizon_minutes(training_metadata)
+    target_horizon_minutes = get_model_target_horizon_minutes(model_path)
     experiment_id = ExperimentTracker.read_experiment_id_from_metadata(
         training_metadata_path
     )
@@ -106,6 +106,8 @@ def main():
     model_feature_columns = training_metadata.get(
         "feature_columns", list(FEATURE_COLUMNS)
     )
+    if len(model_feature_columns) != model.num_feature():
+        model_feature_columns = list(model.feature_name())
     X_holdout = df_holdout[model_feature_columns].values
     y_holdout = df_holdout[TARGET_COLUMN].values
 

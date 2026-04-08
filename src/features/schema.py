@@ -27,6 +27,8 @@ FEATURE_COLUMNS = (
     "vol_ratio_30m",
     "trades_intensity",
     "trend_alignment",
+    "pseudo_liq_imbalance_1m",
+    "pseudo_liq_imbalance_5m",
 )
 
 TARGET_COLUMN = "target"

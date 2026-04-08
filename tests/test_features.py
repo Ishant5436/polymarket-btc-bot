@@ -1,7 +1,10 @@
 """Tests for feature engineering indicators."""
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
+import pandas as pd
 
 from src.features.indicators import (
     fractional_differentiation,
@@ -12,6 +15,7 @@ from src.features.indicators import (
     trade_flow_imbalance,
     vwap_deviation,
 )
+from src.features.minute_features import aggregate_trades_to_1m_bars, compute_feature_frame
 
 
 class TestOrderBookImbalance:
@@ -156,3 +160,165 @@ class TestFractionalDifferentiation:
         valid = result[~np.isnan(result)]
         # The variance should be less than the original trend
         assert np.var(valid) < np.var(trend)
+
+
+class TestPseudoLiquidations:
+    def test_sell_side_flush_creates_positive_pseudo_liq_imbalance(self):
+        bars = pd.DataFrame(
+            [
+                {
+                    "open_time": pd.Timestamp("2024-01-01 00:00:00"),
+                    "open": 100.0,
+                    "high": 101.0,
+                    "low": 99.5,
+                    "close": 100.2,
+                    "volume": 10.0,
+                    "taker_buy_base": 5.0,
+                    "trades_count": 20,
+                    "liq_long_notional": 0.0,
+                    "liq_short_notional": 0.0,
+                },
+                {
+                    "open_time": pd.Timestamp("2024-01-01 00:01:00"),
+                    "open": 100.0,
+                    "high": 101.0,
+                    "low": 93.0,
+                    "close": 94.0,
+                    "volume": 120.0,
+                    "taker_buy_base": 2.0,
+                    "trades_count": 160,
+                    "liq_long_notional": 0.0,
+                    "liq_short_notional": 0.0,
+                },
+            ]
+        )
+
+        features = compute_feature_frame(bars)
+
+        assert features.iloc[-1]["pseudo_liq_imbalance_1m"] > 0
+        assert (
+            features.iloc[-1]["pseudo_liq_imbalance_1m"]
+            > features.iloc[0]["pseudo_liq_imbalance_1m"]
+        )
+
+    def test_buy_side_squeeze_creates_negative_pseudo_liq_imbalance(self):
+        bars = pd.DataFrame(
+            [
+                {
+                    "open_time": pd.Timestamp("2024-01-01 00:00:00"),
+                    "open": 100.0,
+                    "high": 100.4,
+                    "low": 99.8,
+                    "close": 100.1,
+                    "volume": 12.0,
+                    "taker_buy_base": 6.0,
+                    "trades_count": 18,
+                    "liq_long_notional": 0.0,
+                    "liq_short_notional": 0.0,
+                },
+                {
+                    "open_time": pd.Timestamp("2024-01-01 00:01:00"),
+                    "open": 100.0,
+                    "high": 108.0,
+                    "low": 99.4,
+                    "close": 107.5,
+                    "volume": 130.0,
+                    "taker_buy_base": 127.0,
+                    "trades_count": 170,
+                    "liq_long_notional": 0.0,
+                    "liq_short_notional": 0.0,
+                },
+            ]
+        )
+
+        features = compute_feature_frame(bars)
+
+        assert features.iloc[-1]["pseudo_liq_imbalance_1m"] < 0
+
+    def test_quiet_balanced_bar_keeps_pseudo_liq_near_zero(self):
+        bars = pd.DataFrame(
+            [
+                {
+                    "open_time": pd.Timestamp("2024-01-01 00:00:00"),
+                    "open": 100.0,
+                    "high": 100.3,
+                    "low": 99.9,
+                    "close": 100.1,
+                    "volume": 20.0,
+                    "taker_buy_base": 10.0,
+                    "trades_count": 25,
+                    "liq_long_notional": 0.0,
+                    "liq_short_notional": 0.0,
+                },
+                {
+                    "open_time": pd.Timestamp("2024-01-01 00:01:00"),
+                    "open": 100.1,
+                    "high": 100.4,
+                    "low": 99.95,
+                    "close": 100.0,
+                    "volume": 21.0,
+                    "taker_buy_base": 10.5,
+                    "trades_count": 24,
+                    "liq_long_notional": 0.0,
+                    "liq_short_notional": 0.0,
+                },
+            ]
+        )
+
+        features = compute_feature_frame(bars)
+
+        assert abs(features.iloc[-1]["pseudo_liq_imbalance_1m"]) < 0.05
+
+
+class TestMinuteBarAggregation:
+    def test_aggregate_trades_to_1m_bars_merges_liquidations_without_series_view(self):
+        trades = [
+            SimpleNamespace(
+                timestamp=1_710_000_000_000,
+                price=100.0,
+                quantity=1.0,
+                is_buyer_maker=False,
+            ),
+            SimpleNamespace(
+                timestamp=1_710_000_030_000,
+                price=101.0,
+                quantity=2.0,
+                is_buyer_maker=True,
+            ),
+            SimpleNamespace(
+                timestamp=1_710_000_060_000,
+                price=102.0,
+                quantity=1.5,
+                is_buyer_maker=False,
+            ),
+            SimpleNamespace(
+                timestamp=1_710_000_119_500,
+                price=103.0,
+                quantity=1.0,
+                is_buyer_maker=False,
+            ),
+        ]
+        liquidations = [
+            SimpleNamespace(
+                timestamp=1_710_000_010_000,
+                price=99.0,
+                quantity=3.0,
+                side="SELL",
+            ),
+            SimpleNamespace(
+                timestamp=1_710_000_090_000,
+                price=104.0,
+                quantity=2.0,
+                side="BUY",
+            ),
+        ]
+
+        bars = aggregate_trades_to_1m_bars(
+            trades,
+            liquidations,
+            include_incomplete_last_bar=True,
+        )
+
+        assert len(bars) == 2
+        assert bars["liq_long_notional"].tolist() == pytest.approx([297.0, 0.0])
+        assert bars["liq_short_notional"].tolist() == pytest.approx([0.0, 208.0])

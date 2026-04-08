@@ -1,11 +1,11 @@
 """Tests for the order routing logic."""
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
 from src.exchange.gamma_api import MarketInfo
-from src.execution.order_router import OrderRouter, TradingSignal
+from src.execution.order_router import OrderRouter
 
 
 @pytest.fixture
@@ -34,15 +34,31 @@ def market_info():
     )
 
 
+def _build_router(mock_client, **overrides):
+    """Build a router with test-stable defaults, independent of local .env."""
+    config = {
+        "client": mock_client,
+        "min_edge": 0.02,
+        "min_side_probability": 0.52,
+        "max_entry_price": 0.90,
+        "order_size": 1.0,
+        "order_notional": 0.0,
+        "gtd_ttl": 10,
+        "dry_run": False,
+        "allow_upsize_to_min_order_size": False,
+        "bankroll_fraction_per_order": 1.0,
+        "max_order_notional": 0.0,
+        "reserve_collateral_amount": 0.0,
+        "min_order_book_imbalance": 0.35,
+        "max_ask_wall_ratio": 2.5,
+    }
+    config.update(overrides)
+    return OrderRouter(**config)
+
+
 @pytest.fixture
 def router(mock_client):
-    return OrderRouter(
-        client=mock_client,
-        min_edge=0.02,
-        order_size=1.0,
-        gtd_ttl=10,
-        dry_run=False,
-    )
+    return _build_router(mock_client)
 
 
 class TestOrderRouter:
@@ -140,13 +156,7 @@ class TestOrderRouter:
 
     def test_dry_run_does_not_place_order(self, mock_client, market_info):
         """Dry-run mode should simulate orders without touching the client."""
-        router = OrderRouter(
-            client=mock_client,
-            min_edge=0.02,
-            order_size=1.0,
-            gtd_ttl=10,
-            dry_run=True,
-        )
+        router = _build_router(mock_client, dry_run=True)
         mock_client.get_best_bid_ask.side_effect = [
             (0.48, 0.50),
             (0.48, 0.50),
@@ -157,18 +167,34 @@ class TestOrderRouter:
         assert result is not None
         assert result.success
         assert result.raw_response["dry_run"] is True
+        assert result.raw_response["simulated_fill"] is True
         assert router.orders_simulated == 1
+        mock_client.place_post_only_gtd.assert_not_called()
+
+    def test_dry_run_marks_far_from_market_maker_order_as_unfilled(
+        self, mock_client, market_info
+    ):
+        """Paper diagnostics should not treat a deep resting maker order as filled."""
+        router = _build_router(mock_client, dry_run=True)
+        mock_client.get_best_bid_ask.side_effect = [
+            (0.04, 0.50),
+            (0.49, 0.50),
+        ]
+
+        result = router.evaluate_and_trade(0.60, market_info)
+
+        assert result is not None
+        assert result.success
+        assert result.raw_response["dry_run"] is True
+        assert result.raw_response["simulated_fill"] is False
         mock_client.place_post_only_gtd.assert_not_called()
 
     def test_confidence_threshold_blocks_low_probability_yes_lottery_ticket(
         self, mock_client, market_info
     ):
-        router = OrderRouter(
-            client=mock_client,
-            min_edge=0.02,
+        router = _build_router(
+            mock_client,
             min_side_probability=0.25,
-            order_size=1.0,
-            gtd_ttl=10,
             dry_run=True,
         )
         mock_client.get_best_bid_ask.side_effect = [
@@ -184,12 +210,9 @@ class TestOrderRouter:
     def test_confidence_threshold_blocks_subthreshold_yes_signal(
         self, mock_client, market_info
     ):
-        router = OrderRouter(
-            client=mock_client,
-            min_edge=0.02,
+        router = _build_router(
+            mock_client,
             min_side_probability=0.52,
-            order_size=1.0,
-            gtd_ttl=10,
             dry_run=True,
         )
         mock_client.get_best_bid_ask.side_effect = [
@@ -205,13 +228,10 @@ class TestOrderRouter:
     def test_max_entry_price_blocks_expensive_no_contract(
         self, mock_client, market_info
     ):
-        router = OrderRouter(
-            client=mock_client,
-            min_edge=0.02,
+        router = _build_router(
+            mock_client,
             min_side_probability=0.52,
             max_entry_price=0.90,
-            order_size=1.0,
-            gtd_ttl=10,
             dry_run=True,
         )
         mock_client.get_best_bid_ask.side_effect = [
@@ -227,12 +247,9 @@ class TestOrderRouter:
     def test_sell_wall_order_book_filter_blocks_entry(
         self, mock_client, market_info
     ):
-        router = OrderRouter(
-            client=mock_client,
-            min_edge=0.02,
+        router = _build_router(
+            mock_client,
             min_side_probability=0.25,
-            order_size=1.0,
-            gtd_ttl=10,
             dry_run=True,
             min_order_book_imbalance=0.35,
             max_ask_wall_ratio=2.5,
@@ -261,13 +278,9 @@ class TestOrderRouter:
 
     def test_duplicate_signal_suppression(self, mock_client, market_info):
         """Repeated identical signals inside the guard window should be skipped."""
-        router = OrderRouter(
-            client=mock_client,
-            min_edge=0.02,
-            order_size=1.0,
-            gtd_ttl=10,
+        router = _build_router(
+            mock_client,
             duplicate_window_seconds=60,
-            dry_run=False,
         )
         mock_client.get_best_bid_ask.side_effect = [
             (0.48, 0.50),
@@ -332,13 +345,7 @@ class TestOrderRouter:
         self, mock_client, market_info
     ):
         """Paper mode should still simulate the strategy path even if live sizing would fail."""
-        router = OrderRouter(
-            client=mock_client,
-            min_edge=0.02,
-            order_size=1.0,
-            gtd_ttl=10,
-            dry_run=True,
-        )
+        router = _build_router(mock_client, dry_run=True)
         market = MarketInfo(
             condition_id=market_info.condition_id,
             question=market_info.question,
@@ -372,12 +379,9 @@ class TestOrderRouter:
         self, mock_client, market_info
     ):
         """Live orders should downsize to the configured spend cap when needed."""
-        router = OrderRouter(
-            client=mock_client,
-            min_edge=0.02,
+        router = _build_router(
+            mock_client,
             order_size=10.0,
-            gtd_ttl=10,
-            dry_run=False,
             bankroll_fraction_per_order=0.25,
         )
         mock_client.get_available_collateral.return_value = 4.0
@@ -397,13 +401,10 @@ class TestOrderRouter:
         self, mock_client, market_info
     ):
         """Dollar-based sizing should convert a $1 target into the right share count."""
-        router = OrderRouter(
-            client=mock_client,
-            min_edge=0.02,
+        router = _build_router(
+            mock_client,
             order_size=99.0,
             order_notional=1.0,
-            gtd_ttl=10,
-            dry_run=False,
         )
         mock_client.get_best_bid_ask.side_effect = [
             (0.48, 0.50),
@@ -421,12 +422,9 @@ class TestOrderRouter:
         self, mock_client, market_info
     ):
         """A strict $1 cap must fail closed if the venue minimum needs more capital."""
-        router = OrderRouter(
-            client=mock_client,
-            min_edge=0.02,
+        router = _build_router(
+            mock_client,
             order_notional=1.0,
-            gtd_ttl=10,
-            dry_run=False,
             max_order_notional=1.0,
         )
         market = MarketInfo(
@@ -455,12 +453,9 @@ class TestOrderRouter:
         self, mock_client, market_info
     ):
         """Venue minimums should block orders that the bankroll cannot support."""
-        router = OrderRouter(
-            client=mock_client,
-            min_edge=0.02,
+        router = _build_router(
+            mock_client,
             order_size=10.0,
-            gtd_ttl=10,
-            dry_run=False,
         )
         market = MarketInfo(
             condition_id=market_info.condition_id,
@@ -489,13 +484,7 @@ class TestOrderRouter:
         self, mock_client, market_info
     ):
         """Paper trading should fall back to indicative prices when asks are unusable."""
-        router = OrderRouter(
-            client=mock_client,
-            min_edge=0.02,
-            order_size=1.0,
-            gtd_ttl=10,
-            dry_run=True,
-        )
+        router = _build_router(mock_client, dry_run=True)
         market = MarketInfo(
             condition_id=market_info.condition_id,
             question=market_info.question,
@@ -522,13 +511,10 @@ class TestOrderRouter:
         self, mock_client, market_info
     ):
         """Paper trading should respect a tight live book even if indicative pricing disagrees."""
-        router = OrderRouter(
-            client=mock_client,
-            min_edge=0.02,
+        router = _build_router(
+            mock_client,
             min_side_probability=0.52,
             max_entry_price=0.90,
-            order_size=1.0,
-            gtd_ttl=10,
             dry_run=True,
         )
         market = MarketInfo(

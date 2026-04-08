@@ -1,5 +1,8 @@
 """Tests for rolling state behavior."""
 
+import numpy as np
+import pytest
+
 from src.utils.state import RollingState
 
 
@@ -74,3 +77,34 @@ class TestRollingState:
 
         assert state.get_price_at_or_before(6500) == 102.0
         assert state.get_price_at_or_before(900) is None
+
+    def test_get_volatility_uses_one_second_close_prices(self):
+        state = RollingState(maxlen=50)
+        base_timestamp = 1_000_000
+        closes: list[float] = []
+        trade_id = 0
+
+        for second in range(5):
+            close_price = 100.0 + (second * 0.02)
+            closes.append(close_price)
+            for offset, price in (
+                (0, close_price + 0.08),
+                (200, close_price - 0.08),
+                (400, close_price + 0.05),
+                (800, close_price),
+            ):
+                state.push_trade_sync(
+                    {
+                        "price": price,
+                        "quantity": 1.0,
+                        "timestamp": base_timestamp + (second * 1000) + offset,
+                        "is_buyer_maker": False,
+                        "trade_id": trade_id,
+                    }
+                )
+                trade_id += 1
+
+        close_prices = np.array(closes, dtype=np.float64)
+        expected = float(np.std(np.log(close_prices[1:] / close_prices[:-1])))
+
+        assert state.get_volatility(5) == pytest.approx(expected)

@@ -21,7 +21,8 @@ def _get_bool_env(name: str, default: bool) -> bool:
 @dataclass(frozen=True)
 class BinanceConfig:
     """Binance WebSocket and REST API configuration."""
-    ws_url: str = "wss://stream.binance.com:9443/ws/btcusdt@aggTrade"
+    ws_url: str = "wss://fstream.binance.com/stream?streams=btcusdt@aggTrade/btcusdt@forceOrder"
+    ws_url_spot_fallback: str = "wss://stream.binance.com:9443/ws/btcusdt@aggTrade"  # Spot fallback (no liquidations)
     rest_base: str = "https://api.binance.com"
     kline_endpoint: str = "/api/v3/klines"
     agg_trades_endpoint: str = "/api/v3/aggTrades"
@@ -29,6 +30,9 @@ class BinanceConfig:
     reconnect_delay_base: float = 1.0
     reconnect_delay_max: float = 60.0
     connection_lifetime_hours: int = 23  # Rotate before 24h Binance limit
+    enable_spot_fallback: bool = field(
+        default_factory=lambda: _get_bool_env("BINANCE_ENABLE_SPOT_FALLBACK", True)
+    )  # Enable automatic fallback to Spot if Futures fails
 
 
 @dataclass(frozen=True)
@@ -228,6 +232,16 @@ class RiskConfig:
     """Risk management parameters."""
     volatility_sigma_threshold: float = field(
         default_factory=lambda: float(os.getenv("VOLATILITY_SIGMA_THRESHOLD", "3.0"))
+    )
+    volatility_min_absolute_threshold: float = field(
+        default_factory=lambda: float(
+            os.getenv("VOLATILITY_MIN_ABSOLUTE_THRESHOLD", "0.00005")
+        )
+    )
+    volatility_min_relative_multiplier: float = field(
+        default_factory=lambda: float(
+            os.getenv("VOLATILITY_MIN_RELATIVE_MULTIPLIER", "4.0")
+        )
     )
     kill_switch_cooldown_seconds: int = field(
         default_factory=lambda: int(os.getenv("KILL_SWITCH_COOLDOWN_SECONDS", "60"))

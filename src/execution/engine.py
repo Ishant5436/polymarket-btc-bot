@@ -24,6 +24,7 @@ from src.exchange.binance_rest import BinanceRESTClient
 from src.exchange.binance_ws import BinanceWebSocket
 from src.exchange.gamma_api import GammaAPIClient, MarketInfo
 from src.exchange.polymarket_client import PolymarketClient
+from src.exchange.polymarket_ws import PolymarketWebSocket
 from src.execution.inference import ModelInference
 from src.execution.live_test_gate import LiveTestGate
 from src.execution.order_router import OrderRouter
@@ -64,9 +65,11 @@ class TradingEngine:
     ):
         # Core state
         self._state = RollingState()
-        self._model = ModelInference()
+        self._model: Optional[ModelInference] = None
+        self._models: dict[int, ModelInference] = {}
         self._probability_estimator = MarketProbabilityEstimator()
-        self._pipeline = FeaturePipeline(self._state)
+        self._pipeline: Optional[FeaturePipeline] = None
+        self._pipelines: dict[int, FeaturePipeline] = {}
         self._trend_filter = TrendFilter()
         
         # Exchange clients
@@ -74,6 +77,7 @@ class TradingEngine:
         self._binance_ws = BinanceWebSocket()
         self._gamma = GammaAPIClient()
         self._pm_client: Optional[PolymarketClient] = None
+        self._pm_ws = PolymarketWebSocket()
         
         # Execution
         self._dry_run = dry_run_override if dry_run_override is not None else TRADING.dry_run
@@ -117,20 +121,93 @@ class TradingEngine:
         """Return True when authenticated private Polymarket access is required."""
         return self._is_validation_only_mode() or not self._dry_run
 
+    @staticmethod
+    def _parse_target_horizon_minutes(value: object) -> int:
+        """Normalize model/market horizon metadata into a positive integer."""
+        if isinstance(value, bool):
+            return 0
+        if isinstance(value, (int, float, str)):
+            try:
+                parsed = int(value)
+            except (TypeError, ValueError):
+                return 0
+            return parsed if parsed > 0 else 0
+        return 0
+
+    def _configured_model_horizons(self) -> list[int]:
+        """Return all known target horizons across legacy and multi-model state."""
+        horizons = sorted(
+            horizon
+            for horizon in self._models.keys()
+            if isinstance(horizon, int) and horizon > 0
+        )
+
+        legacy_horizon = self._parse_target_horizon_minutes(
+            getattr(self._model, "target_horizon_minutes", None)
+        )
+        if self._model is not None:
+            legacy_horizon = legacy_horizon or DEFAULT_TARGET_HORIZON_MINUTES
+            if legacy_horizon not in horizons:
+                horizons.append(legacy_horizon)
+                horizons.sort()
+
+        return horizons
+
+    def _active_pipelines(self) -> list[FeaturePipeline]:
+        """Return currently configured pipelines, including legacy single-model state."""
+        if self._pipelines:
+            return list(self._pipelines.values())
+        if self._pipeline is not None:
+            return [self._pipeline]
+        return []
+
+    def _prediction_count(self) -> int:
+        """Return total predictions emitted across loaded models."""
+        if self._models:
+            return sum(
+                int(getattr(model, "prediction_count", 0))
+                for model in self._models.values()
+            )
+        return int(getattr(self._model, "prediction_count", 0)) if self._model else 0
+
+    def _resolve_inference_stack(
+        self,
+        target_horizon: int,
+    ) -> tuple[Optional[object], Optional[object]]:
+        """Resolve the best available model/pipeline pair for a target horizon."""
+        if target_horizon in self._models and target_horizon in self._pipelines:
+            return self._models[target_horizon], self._pipelines[target_horizon]
+
+        if self._model is not None and self._pipeline is not None:
+            legacy_horizon = (
+                self._parse_target_horizon_minutes(
+                    getattr(self._model, "target_horizon_minutes", None)
+                )
+                or DEFAULT_TARGET_HORIZON_MINUTES
+            )
+            if legacy_horizon == target_horizon or not self._models:
+                return self._model, self._pipeline
+
+        fallback_horizon = DEFAULT_TARGET_HORIZON_MINUTES
+        if fallback_horizon in self._models and fallback_horizon in self._pipelines:
+            return self._models[fallback_horizon], self._pipelines[fallback_horizon]
+
+        if self._model is not None and self._pipeline is not None:
+            return self._model, self._pipeline
+
+        return None, None
+
     def _expected_market_interval_minutes(self) -> int:
         """Return the model's native target horizon for market compatibility checks."""
         interval = getattr(self._model, "target_horizon_minutes", None)
-        if isinstance(interval, bool):
-            parsed = 0
-        elif isinstance(interval, (int, float, str)):
-            try:
-                parsed = int(interval)
-            except (TypeError, ValueError):
-                parsed = 0
-        else:
-            parsed = 0
+        parsed = self._parse_target_horizon_minutes(interval)
         if parsed > 0:
             return parsed
+        configured_horizons = self._configured_model_horizons()
+        if 5 in configured_horizons:
+            return 5
+        if configured_horizons:
+            return configured_horizons[0]
         return DEFAULT_TARGET_HORIZON_MINUTES
 
     def _market_supports_live_strategy(self, market: MarketInfo) -> bool:
@@ -145,8 +222,11 @@ class TradingEngine:
             return True
 
         interval = getattr(market, "market_interval_minutes", None)
+        supported_intervals = set(self._configured_model_horizons())
         expected_interval = self._expected_market_interval_minutes()
-        if interval is None or interval == expected_interval:
+        if not supported_intervals:
+            supported_intervals = {expected_interval}
+        if interval is None or interval in supported_intervals:
             self._last_live_horizon_notice_key = None
             return True
         if getattr(TRADING, "allow_non_5m_live_markets", False):
@@ -224,6 +304,9 @@ class TradingEngine:
             )
 
         self._active_market = refreshed
+        asyncio.create_task(
+            self._pm_ws.subscribe([refreshed.yes_token_id, refreshed.no_token_id])
+        )
         return True
 
     def _run_private_connectivity_checks(
@@ -266,6 +349,15 @@ class TradingEngine:
         try:
             read_only_mode = self._is_read_only_mode()
             requires_private_access = self._requires_private_trading_access()
+
+            logger.info(
+                "Runtime mode resolved | dry_run=%s validation_only=%s "
+                "read_only=%s private_access=%s",
+                self._dry_run,
+                self._is_validation_only_mode(),
+                read_only_mode,
+                requires_private_access,
+            )
 
             if not read_only_mode and not getattr(TRADING, "live_trading_enabled", False):
                 logger.error(
@@ -370,8 +462,11 @@ class TradingEngine:
             return False
 
         raw_response = getattr(result, "raw_response", None)
-        if isinstance(raw_response, dict) and raw_response.get("live_blocked"):
-            return False
+        if isinstance(raw_response, dict):
+            if raw_response.get("live_blocked"):
+                return False
+            if raw_response.get("dry_run"):
+                return bool(raw_response.get("simulated_fill"))
 
         return True
 
@@ -402,36 +497,45 @@ class TradingEngine:
         return True
 
     def _load_model(self) -> bool:
-        """Load the trained LightGBM model."""
-        success = self._model.load()
-        if not success:
-            logger.error(
-                "Model loading failed — ensure you've run the training pipeline first"
-            )
+        """Load all available trained LightGBM models."""
+        for horizon in [5, 60]:
+            from config.settings import PATHS
+            import os
+            model_path = os.path.join(PATHS.models_dir, f"lgbm_btc_{horizon}m.txt")
+            if os.path.exists(model_path):
+                model = ModelInference(model_path=model_path)
+                if model.load():
+                    self._models[horizon] = model
+                    model_features = model.metadata.get("feature_columns")
+                    if model_features:
+                        self._pipelines[horizon] = FeaturePipeline(
+                            self._state, model_feature_columns=model_features
+                        )
+                        logger.info(
+                            "Pipeline configured for %d model features (horizon %dm)", 
+                            len(model_features), horizon
+                        )
+
+        if not self._models:
+            logger.error("No models loaded! Train models before running.")
             return False
 
-        # Re-initialize pipeline with the model's actual feature columns
-        # (the model may have been trained on a pruned feature subset)
-        model_features = self._model.metadata.get("feature_columns")
-        if model_features:
-            self._pipeline = FeaturePipeline(
-                self._state, model_feature_columns=model_features
-            )
-            logger.info(
-                "Pipeline configured for %d model features", len(model_features)
-            )
-
+        primary_horizon = 5 if 5 in self._models else min(self._models)
+        self._model = self._models[primary_horizon]
+        self._pipeline = self._pipelines.get(primary_horizon)
+            
         return True
 
     def _build_runtime_summary(self) -> dict:
         """Return a compact end-of-run summary for audit manifests."""
+        pipelines = self._active_pipelines()
         summary = {
             "mode": self._mode_label(),
             "running": self._running,
             "state_size": self._state.size,
-            "minute_bars": self._pipeline.minute_bar_count,
-            "prediction_count": self._model.prediction_count,
-            "model_target_horizon_minutes": self._expected_market_interval_minutes(),
+            "minute_bars": pipelines[0].minute_bar_count if pipelines else 0,
+            "prediction_count": self._prediction_count(),
+            "model_target_horizon_minutes": self._configured_model_horizons(),
             "active_market": None,
         }
 
@@ -482,7 +586,11 @@ class TradingEngine:
         """
         Backfill recent closed Binance minute bars so inference can start promptly.
         """
-        target_bars = self._pipeline.required_complete_bars + 18
+        pipelines = self._active_pipelines()
+        target_bars = max(
+            (p.required_complete_bars for p in pipelines),
+            default=1,
+        ) + 18
         try:
             bars = self._binance_rest.fetch_recent_1m_klines(limit=target_bars)
         except Exception as e:
@@ -493,13 +601,14 @@ class TradingEngine:
             logger.warning("Historical Binance warmup returned no closed minute bars")
             return
 
-        self._pipeline.seed_historical_bars(bars)
+        for p in pipelines:
+            p.seed_historical_bars(bars)
+        
         logger.info(
-            "Seeded pipeline minute-bar history | bars=%d range=%s -> %s required=%d",
+            "Seeded pipeline minute-bar history | bars=%d range=%s -> %s",
             len(bars),
             bars["open_time"].iloc[0],
             bars["open_time"].iloc[-1],
-            self._pipeline.required_complete_bars,
         )
 
     async def _binance_consumer_task(self):
@@ -519,8 +628,8 @@ class TradingEngine:
         try:
             while self._running:
                 try:
-                    trade = await asyncio.wait_for(queue.get(), timeout=5.0)
-                    await self._state.push_trade(trade)
+                    event = await asyncio.wait_for(queue.get(), timeout=5.0)
+                    await self._state.push_event(event)
                 except asyncio.TimeoutError:
                     continue
         except asyncio.CancelledError:
@@ -545,6 +654,11 @@ class TradingEngine:
                                 market.slug,
                                 market.yes_token_id[:16] + "...",
                             )
+                            asyncio.create_task(
+                                self._pm_ws.subscribe(
+                                    [market.yes_token_id, market.no_token_id]
+                                )
+                            )
                         self._active_market = market
                     else:
                         logger.warning("No active BTC market found")
@@ -565,22 +679,28 @@ class TradingEngine:
         logger.info("Starting inference & trading loop...")
         inference_interval = 1.0  # seconds between inference cycles
 
-        # Wait until the feature pipeline has enough closed minute bars.
-        while self._running and not self._pipeline.is_ready:
-            logger.debug(
-                "Warming up feature pipeline... minute_bars=%d/%d trades=%d",
-                self._pipeline.minute_bar_count,
-                self._pipeline.required_complete_bars,
-                self._state.size,
-            )
+        # Wait until all feature pipelines have enough closed minute bars.
+        while self._running:
+            pipelines = self._active_pipelines()
+            if pipelines and all(p.is_ready for p in pipelines):
+                break
+            if pipelines:
+                p = pipelines[0]
+                logger.debug(
+                    "Warming up feature pipelines... minute_bars=%d trades=%d",
+                    p.minute_bar_count,
+                    self._state.size,
+                )
             await asyncio.sleep(2)
 
         if not self._running:
             return
 
         logger.info(
-            "Feature pipeline ready — beginning inference | minute_bars=%d",
-            self._pipeline.minute_bar_count,
+            "Feature pipelines ready — beginning inference | minute_bars=%d",
+            self._active_pipelines()[0].minute_bar_count
+            if self._active_pipelines()
+            else 0,
         )
 
         try:
@@ -607,7 +727,12 @@ class TradingEngine:
                     exit_execution.result.raw_response
                     and exit_execution.result.raw_response.get("dry_run")
                 )
-                if is_dry_run_exit and self._risk and abs(exit_execution.realized_pnl) > 1e-9:
+                if (
+                    is_dry_run_exit
+                    and self._risk
+                    and not self._is_read_only_mode()
+                    and abs(exit_execution.realized_pnl) > 1e-9
+                ):
                     self._risk.update_pnl(exit_execution.realized_pnl)
 
         # Need an active market to trade
@@ -640,13 +765,25 @@ class TradingEngine:
             ):
                 return
 
+        # Route to appropriate model
+        target_horizon = self._parse_target_horizon_minutes(
+            getattr(self._active_market, "market_interval_minutes", None)
+        )
+        if target_horizon <= 0:
+            target_horizon = self._expected_market_interval_minutes()
+
+        model, pipeline = self._resolve_inference_stack(target_horizon)
+        if model is None or pipeline is None:
+            logger.error("No model available for fallback.")
+            return
+
         # Compute features
-        features = self._pipeline.compute()
+        features = pipeline.compute()
         if features is None:
             return
 
         # Run inference
-        raw_prob = self._model.predict(features)
+        raw_prob = model.predict(features)
         if raw_prob is None:
             return
 
@@ -781,7 +918,15 @@ class TradingEngine:
             self._tracked_realized_pnl_by_position[position_key] = realized_pnl
 
             if previous_realized is None:
-                pnl_delta += realized_pnl
+                # Position appeared after our baseline snapshot — could be a
+                # pre-existing wallet position that wasn't in the first API
+                # page. Treat its current P&L as the new baseline instead of
+                # counting the full amount as session delta.
+                logger.debug(
+                    "New position appeared post-baseline | key=%s realized=%.4f (baselined)",
+                    position_key[:24],
+                    realized_pnl,
+                )
             else:
                 pnl_delta += realized_pnl - previous_realized
 
@@ -858,16 +1003,17 @@ class TradingEngine:
         try:
             while self._running:
                 await asyncio.sleep(300)  # Every 5 minutes
-                
+
+                pipelines = self._active_pipelines()
                 status = {
                     "state_size": self._state.size,
                     "state_maxlen": self._state.maxlen,
                     "history_span_seconds": round(self._state.history_span_seconds, 1),
-                    "minute_bars": self._pipeline.minute_bar_count,
-                    "pipeline_ready": self._pipeline.is_ready,
+                    "minute_bars": pipelines[0].minute_bar_count if pipelines else 0,
+                    "pipeline_ready": all(p.is_ready for p in pipelines),
                     "last_price": self._state.last_price,
                     "trades_received": self._state.trade_count,
-                    "predictions": self._model.prediction_count,
+                    "predictions": self._prediction_count(),
                     "dry_run": self._dry_run,
                     "validation_only_mode": self._is_validation_only_mode(),
                     "active_market": (
@@ -882,6 +1028,7 @@ class TradingEngine:
                     status["duplicate_signals_suppressed"] = (
                         self._router.duplicate_signals_suppressed
                     )
+                    status["filter_rejections"] = self._router.filter_stats
 
                 if self._live_test_gate:
                     status["live_test"] = self._live_test_gate.get_status()
@@ -976,6 +1123,7 @@ class TradingEngine:
             asyncio.create_task(self._risk_monitor_task(), name="risk_monitor"),
             asyncio.create_task(self._status_reporter_task(), name="status"),
             asyncio.create_task(self._pnl_tracking_task(), name="pnl_tracker"),
+            asyncio.create_task(self._pm_ws.start(), name="pm_ws"),
         ]
 
         logger.info("All %d tasks launched", len(tasks))
@@ -1036,6 +1184,7 @@ class TradingEngine:
 
         # Close connections
         await self._binance_ws.stop()
+        await self._pm_ws.stop()
         self._binance_rest.close()
         self._gamma.close()
 

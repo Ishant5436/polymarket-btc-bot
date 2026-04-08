@@ -1000,13 +1000,77 @@ async def test_run_inference_cycle_records_position_for_fillable_dry_run():
     engine._router.get_signal.return_value = signal
     engine._router.execute_signal.return_value = SimpleNamespace(
         success=True,
-        raw_response={"dry_run": True, "live_blocked": False},
+        raw_response={
+            "dry_run": True,
+            "live_blocked": False,
+            "simulated_fill": True,
+        },
     )
     engine._position_manager = MagicMock()
 
     await engine._run_inference_cycle()
 
     engine._position_manager.record_entry.assert_called_once_with(signal, market)
+
+
+@pytest.mark.asyncio
+async def test_run_inference_cycle_does_not_record_position_for_unfilled_dry_run():
+    engine = TradingEngine()
+    market = MarketInfo(
+        condition_id="test-condition",
+        question="Will BTC go up in 5 minutes?",
+        slug="btc-5min-test",
+        yes_token_id="yes-token",
+        no_token_id="no-token",
+        end_date="2099-04-05T12:05:00Z",
+    )
+    signal = TradingSignal(
+        side="BUY_YES",
+        token_id="yes-token",
+        price=0.05,
+        size=1.0,
+        edge=0.05,
+        model_prob=0.55,
+        market_price=0.50,
+        timestamp=1_000.0,
+    )
+
+    engine._risk = SimpleNamespace(run_all_checks=lambda **kwargs: True)
+    engine._active_market = market
+    engine._pipeline = SimpleNamespace(compute=lambda: np.zeros(20))
+    engine._model = SimpleNamespace(predict=lambda features: 0.55)
+    engine._router = MagicMock()
+    engine._router.get_signal.return_value = signal
+    engine._router.execute_signal.return_value = SimpleNamespace(
+        success=True,
+        raw_response={
+            "dry_run": True,
+            "live_blocked": False,
+            "simulated_fill": False,
+        },
+    )
+    engine._position_manager = MagicMock()
+
+    await engine._run_inference_cycle()
+
+    engine._position_manager.record_entry.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_run_inference_cycle_does_not_feed_simulated_exit_pnl_into_read_only_risk():
+    engine = TradingEngine(validation_only_override=True)
+    engine._position_manager = MagicMock()
+    engine._position_manager.evaluate_positions.return_value = [
+        SimpleNamespace(
+            realized_pnl=-0.6,
+            result=SimpleNamespace(raw_response={"dry_run": True}),
+        )
+    ]
+    engine._risk = MagicMock()
+
+    await engine._run_inference_cycle()
+
+    engine._risk.update_pnl.assert_not_called()
 
 
 @pytest.mark.asyncio

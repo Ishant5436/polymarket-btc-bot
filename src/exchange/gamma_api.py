@@ -59,6 +59,7 @@ class GammaAPIClient:
         self._cached_market: Optional[MarketInfo] = None
         self._event_page_backoff_until_by_slug: dict[str, float] = {}
         self._event_page_backoff_seconds = 300.0
+        self._btc_updown_interval_seconds = 300
 
     def get_active_btc_5m_market(self, force_refresh: bool = False) -> Optional[MarketInfo]:
         """
@@ -192,9 +193,14 @@ class GammaAPIClient:
         Query the Gamma API for the best currently-active BTC market.
 
         Preference order:
-        1. Legacy BTC 5-minute contract, if it exists.
-        2. Active BTC hourly recurring event, selecting the strike closest to 50/50.
+        1. Direct BTC 5-minute up/down event pages (`btc-updown-5m-*`).
+        2. Legacy BTC 5-minute contract, if it exists in Gamma listings.
+        3. Active BTC hourly recurring event, selecting the strike closest to 50/50.
         """
+        market = self._fetch_btc_updown_5m_market()
+        if market is not None:
+            return market
+
         # Strategy 1: Search by tag/keyword
         markets = self._search_markets("btc 5 min")
         if not markets:
@@ -224,6 +230,76 @@ class GammaAPIClient:
             return self._parse_market(best, market_interval_minutes=5)
 
         return self._fetch_btc_hourly_market()
+
+    def _fetch_btc_updown_5m_market(
+        self,
+        now_ts: Optional[float] = None,
+    ) -> Optional[MarketInfo]:
+        """
+        Resolve the live recurring BTC 5-minute up/down market family.
+
+        Polymarket exposes these markets as event pages whose slugs follow a
+        stable pattern:
+
+        `btc-updown-5m-<window_start_epoch_seconds>`
+
+        The page payloads are directly fetchable even when the generic Gamma
+        listings do not surface the family reliably, so we probe the current
+        window plus its immediate neighbors and choose the market whose 5-minute
+        window best matches the current time.
+        """
+        now_ts = time.time() if now_ts is None else now_ts
+        candidates: list[tuple[float, float, MarketInfo]] = []
+
+        for start_ts in self._candidate_btc_updown_5m_start_times(now_ts):
+            slug = self._btc_updown_5m_event_slug(start_ts)
+            market = self._fetch_market_from_event_slug(
+                slug,
+                market_interval_minutes=5,
+            )
+            if market is None:
+                continue
+            if not market.yes_token_id or not market.no_token_id:
+                continue
+
+            end_ts = self._parse_iso_timestamp(market.end_date)
+            if end_ts is None:
+                end_ts = start_ts + self._btc_updown_interval_seconds
+            candidates.append((start_ts, end_ts, market))
+
+        if not candidates:
+            return None
+
+        in_window = [
+            item for item in candidates if item[0] <= now_ts < item[1]
+        ]
+        if in_window:
+            in_window.sort(key=lambda item: (abs(item[0] - now_ts), item[1]))
+            return in_window[0][2]
+
+        future = [item for item in candidates if item[1] > now_ts]
+        if future:
+            future.sort(key=lambda item: (item[0], item[1]))
+            return future[0][2]
+
+        candidates.sort(key=lambda item: item[1], reverse=True)
+        return candidates[0][2]
+
+    def _candidate_btc_updown_5m_start_times(self, now_ts: float) -> list[int]:
+        """Return nearby 5-minute window starts for the recurring up/down family."""
+        base_start = int(now_ts // self._btc_updown_interval_seconds) * self._btc_updown_interval_seconds
+        starts: list[int] = []
+        for offset in (0, -300, 300, -600, 600):
+            start_ts = base_start + offset
+            if start_ts <= 0 or start_ts in starts:
+                continue
+            starts.append(start_ts)
+        return starts
+
+    @staticmethod
+    def _btc_updown_5m_event_slug(start_ts: int) -> str:
+        """Build the event-page slug for a BTC 5-minute up/down market."""
+        return f"btc-updown-5m-{int(start_ts)}"
 
     def _search_markets(self, query: str) -> list:
         """Search markets via the Gamma API."""

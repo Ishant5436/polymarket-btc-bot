@@ -73,6 +73,8 @@ class _FakeTradingConfig:
 @dataclass(frozen=True)
 class _FakeRiskConfig:
     volatility_sigma_threshold: float = 3.0
+    volatility_min_absolute_threshold: float = 0.00005
+    volatility_min_relative_multiplier: float = 4.0
     kill_switch_cooldown_seconds: int = 60
     pnl_floor: float = -0.2
     private_check_cache_ttl_seconds: float = 5.0
@@ -115,6 +117,8 @@ def test_validate_runtime_configuration_rejects_inconsistent_notional_limits(
         "src.utils.run_governance.RISK",
         SimpleNamespace(
             volatility_sigma_threshold=3.0,
+            volatility_min_absolute_threshold=0.00005,
+            volatility_min_relative_multiplier=4.0,
             kill_switch_cooldown_seconds=60,
             private_check_cache_ttl_seconds=5.0,
             pnl_floor=-0.2,
@@ -122,6 +126,45 @@ def test_validate_runtime_configuration_rejects_inconsistent_notional_limits(
     )
 
     with pytest.raises(RuntimeConfigurationError, match="ORDER_NOTIONAL"):
+        validate_runtime_configuration(dry_run=False, validation_only=False)
+
+
+def test_validate_runtime_configuration_rejects_invalid_volatility_guards(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        "src.utils.run_governance.TRADING",
+        SimpleNamespace(
+            live_trading_enabled=True,
+            min_edge=0.02,
+            min_side_probability=0.52,
+            max_entry_price=0.90,
+            gtd_ttl_seconds=10,
+            max_open_positions=3,
+            duplicate_signal_window_seconds=15,
+            order_size=1.0,
+            order_notional=0.0,
+            max_order_notional=0.0,
+            bankroll_fraction_per_order=1.0,
+            reserve_collateral_amount=0.0,
+        ),
+    )
+    monkeypatch.setattr(
+        "src.utils.run_governance.RISK",
+        SimpleNamespace(
+            volatility_sigma_threshold=3.0,
+            volatility_min_absolute_threshold=-0.1,
+            volatility_min_relative_multiplier=0.5,
+            kill_switch_cooldown_seconds=60,
+            private_check_cache_ttl_seconds=5.0,
+            pnl_floor=-0.2,
+        ),
+    )
+
+    with pytest.raises(
+        RuntimeConfigurationError,
+        match="VOLATILITY_MIN_ABSOLUTE_THRESHOLD",
+    ):
         validate_runtime_configuration(dry_run=False, validation_only=False)
 
 

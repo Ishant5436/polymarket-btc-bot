@@ -111,3 +111,37 @@ def test_position_manager_triggers_time_decay_exit_for_bad_threshold_setup():
     assert len(executions) == 1
     assert executions[0].reason == "time_decay_exit"
     assert executions[0].exit_size == pytest.approx(10.0)
+
+
+def test_position_manager_settles_expired_market_without_polling_dead_order_book():
+    client = MagicMock()
+    client.get_best_bid_ask.side_effect = AssertionError(
+        "expired positions should settle before polling the order book"
+    )
+    manager = PositionManager(client, read_only_mode=True)
+    end_date = datetime(2026, 4, 6, 15, 0, tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
+    market = MarketInfo(
+        condition_id="market-1",
+        end_date=end_date,
+        question="Bitcoin Up or Down - 5 Minutes",
+        slug="btc-updown-5m-1775487300",
+        yes_token_id="yes-token",
+        no_token_id="no-token",
+    )
+    market.market_interval_minutes = 5
+    manager.record_entry(_signal(price=0.40, size=10.0), market)
+
+    state = RollingState(maxlen=10)
+    start_ts = int(datetime(2026, 4, 6, 14, 55, tzinfo=timezone.utc).timestamp() * 1000)
+    end_ts = int(datetime(2026, 4, 6, 15, 0, tzinfo=timezone.utc).timestamp() * 1000)
+    _push_trade(state, 100.0, start_ts, 1)
+    _push_trade(state, 101.0, end_ts, 2)
+
+    executions = manager.evaluate_positions(state)
+
+    assert len(executions) == 1
+    assert executions[0].reason == "market_settlement"
+    assert executions[0].exit_price == pytest.approx(1.0)
+    assert executions[0].realized_pnl == pytest.approx((1.0 - 0.40) * 10.0)
+    assert executions[0].remaining_size == 0.0
+    assert executions[0].result.raw_response["settled_position"] is True

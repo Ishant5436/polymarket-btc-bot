@@ -8,7 +8,7 @@ import logging
 import math
 import time
 from dataclasses import dataclass, replace
-from typing import Optional
+from typing import Any, Optional
 
 from config.settings import TRADING
 from src.exchange.gamma_api import GammaAPIClient, MarketInfo
@@ -112,8 +112,10 @@ class OrderRouter:
         kelly_fraction: Optional[float] = None,
         min_time_remaining_seconds: Optional[int] = None,
         use_bid_side_entry: Optional[bool] = None,
+        pm_ws: Optional[Any] = None,
     ):
         self._client = client
+        self._pm_ws = pm_ws
         self._min_edge = min_edge if min_edge is not None else TRADING.min_edge
         self._min_side_probability = (
             min_side_probability
@@ -203,6 +205,16 @@ class OrderRouter:
         self._orders_simulated = 0
         self._duplicate_signals_suppressed = 0
         self._recent_signal_times: dict[str, float] = {}
+        
+        # Gatekeeping filter statistics
+        self._filter_stats = {
+            "edge_too_low": 0,
+            "prob_too_low": 0,
+            "imbalance_too_low": 0,
+            "ask_wall_too_high": 0,
+            "entry_price_too_high": 0,
+            "insufficient_time": 0,
+        }
 
     @property
     def orders_placed(self) -> int:
@@ -219,6 +231,34 @@ class OrderRouter:
     @property
     def duplicate_signals_suppressed(self) -> int:
         return self._duplicate_signals_suppressed
+
+    @property
+    def filter_stats(self) -> dict[str, int]:
+        """Returns a snapshot of the gatekeeping filter statistics."""
+        return self._filter_stats.copy()
+
+    def print_gatekeeping_summary(self) -> None:
+        """Print a summary of which filters have been most restrictive."""
+        logger.info("=" * 80)
+        logger.info("GATEKEEPING FILTER SUMMARY")
+        logger.info("=" * 80)
+        logger.info(
+            "Orders placed: %d | Orders rejected: %d | Orders simulated (dry-run): %d | "
+            "Duplicate signals suppressed: %d",
+            self._orders_placed,
+            self._orders_rejected,
+            self._orders_simulated,
+            self._duplicate_signals_suppressed,
+        )
+        logger.info("-" * 80)
+        logger.info("Filter rejection counts:")
+        for filter_name, count in sorted(
+            self._filter_stats.items(), key=lambda x: -x[1]
+        ):
+            if count > 0:
+                pct = (count / max(sum(self._filter_stats.values()), 1)) * 100
+                logger.info("  %s: %d (%.1f%%)", filter_name, count, pct)
+        logger.info("=" * 80)
 
     def evaluate_and_trade(
         self,
@@ -403,13 +443,16 @@ class OrderRouter:
             signal = replace(signal, size=sizing.size)
 
         if self._dry_run:
+            simulated_fill = self._dry_run_result_represents_fill(signal)
             self._orders_simulated += 1
             logger.info(
-                "Dry-run order simulated | market=%s side=%s price=%.2f size=%.4f #%d",
+                "Dry-run order simulated | market=%s side=%s price=%.2f size=%.4f "
+                "simulated_fill=%s #%d",
                 market.slug or market.condition_id,
                 signal.side,
                 signal.price,
                 signal.size,
+                simulated_fill,
                 self._orders_simulated,
             )
             return OrderResult(
@@ -422,6 +465,7 @@ class OrderRouter:
                     "price": signal.price,
                     "size": signal.size,
                     "live_blocked": False,
+                    "simulated_fill": simulated_fill,
                 },
             )
 
@@ -591,6 +635,21 @@ class OrderRouter:
         """Build a stable deduplication key for a market-side signal."""
         return f"{market.condition_id}:{signal.side}"
 
+    @staticmethod
+    def _dry_run_result_represents_fill(signal: TradingSignal) -> bool:
+        """
+        Treat a dry-run order as fillable only when the simulated entry is
+        close enough to the quoted market price to plausibly trade soon.
+
+        Post-only maker orders that sit far below the best ask should be
+        tracked as resting diagnostics, not as entered positions.
+        """
+        tick = float(TRADING.tick_size)
+        market_price = float(signal.market_price)
+        if market_price <= 0:
+            return False
+        return signal.price >= max(market_price - tick, tick)
+
     def _is_duplicate_signal(self, signal_key: str, now: float) -> bool:
         """
         Return True when a similar signal fired too recently.
@@ -671,6 +730,12 @@ class OrderRouter:
 
         # Improvement 4: Don't enter near market expiry
         if not self._has_sufficient_time_remaining(market):
+            logger.info(
+                "[SKIP] Not enough time remaining | market=%s min_seconds=%d",
+                market.slug or market.condition_id,
+                self._min_time_remaining_seconds,
+            )
+            self._filter_stats["insufficient_time"] += 1
             return None
 
         # --- Check YES side ---
@@ -678,68 +743,140 @@ class OrderRouter:
             # Improvement 1 + 5: dynamic edge scaling
             effective_edge = self._compute_effective_min_edge(model_prob)
             yes_edge = model_prob - yes_ask
-            if yes_edge >= effective_edge and model_prob >= self._min_side_probability:
-                if self._passes_order_book_filters(
+            
+            # Gatekeeping: Log all YES-side filter rejections
+            if yes_edge < effective_edge:
+                logger.info(
+                    "[SKIP_YES] Insufficient edge | model_p=%.4f yes_ask=%.4f "
+                    "edge=%.4f min_edge=%.4f | need +%.4f more",
+                    model_prob,
+                    yes_ask,
+                    yes_edge,
+                    effective_edge,
+                    effective_edge - yes_edge,
+                )
+                self._filter_stats["edge_too_low"] += 1
+            elif model_prob < self._min_side_probability:
+                logger.info(
+                    "[SKIP_YES] Model prob too low | model_p=%.4f "
+                    "min_side_prob=%.4f | need +%.4f higher",
+                    model_prob,
+                    self._min_side_probability,
+                    self._min_side_probability - model_prob,
+                )
+                self._filter_stats["prob_too_low"] += 1
+            elif not self._passes_order_book_filters(
+                market,
+                "BUY_YES",
+                yes_book_snapshot,
+                log_details=True,
+            ):
+                pass  # Logging and tracking already handled in _passes_order_book_filters
+            else:
+                # Improvement 7: bid-side entry for price improvement
+                limit_price = self._compute_entry_price(
+                    yes_bid, yes_ask, "BUY_YES"
+                )
+                if not self._passes_entry_price_filter(
                     market,
                     "BUY_YES",
-                    yes_book_snapshot,
+                    limit_price,
                 ):
-                    # Improvement 7: bid-side entry for price improvement
-                    limit_price = self._compute_entry_price(
-                        yes_bid, yes_ask, "BUY_YES"
+                    pass  # Logging and tracking already handled in _passes_entry_price_filter
+                else:
+                    # Improvement 6: Kelly sizing
+                    size = self._resolve_signal_size(
+                        limit_price, model_prob=model_prob
                     )
-                    if self._passes_entry_price_filter(
-                        market,
-                        "BUY_YES",
+                    logger.info(
+                        "[SIGNAL] YES side accepted | model_p=%.4f yes_ask=%.4f "
+                        "edge=%.4f min_edge=%.4f price=%.2f size=%.4f",
+                        model_prob,
+                        yes_ask,
+                        yes_edge,
+                        effective_edge,
                         limit_price,
-                    ):
-                        # Improvement 6: Kelly sizing
-                        size = self._resolve_signal_size(
-                            limit_price, model_prob=model_prob
-                        )
-                        return TradingSignal(
-                            side="BUY_YES",
-                            token_id=market.yes_token_id,
-                            price=limit_price,
-                            size=size,
-                            edge=yes_edge,
-                            model_prob=model_prob,
-                            market_price=yes_ask,
-                            timestamp=now,
-                        )
+                        size,
+                    )
+                    return TradingSignal(
+                        side="BUY_YES",
+                        token_id=market.yes_token_id,
+                        price=limit_price,
+                        size=size,
+                        edge=yes_edge,
+                        model_prob=model_prob,
+                        market_price=yes_ask,
+                        timestamp=now,
+                    )
 
         # --- Check NO side ---
         no_model_prob = 1.0 - model_prob
         if no_ask is not None and no_ask > 0:
             effective_edge = self._compute_effective_min_edge(no_model_prob)
             no_edge = no_model_prob - no_ask
-            if no_edge >= effective_edge and no_model_prob >= self._min_side_probability:
-                if self._passes_order_book_filters(
+            
+            # Gatekeeping: Log all NO-side filter rejections
+            if no_edge < effective_edge:
+                logger.info(
+                    "[SKIP_NO] Insufficient edge | model_p=%.4f (NO) no_ask=%.4f "
+                    "edge=%.4f min_edge=%.4f | need +%.4f more",
+                    no_model_prob,
+                    no_ask,
+                    no_edge,
+                    effective_edge,
+                    effective_edge - no_edge,
+                )
+                self._filter_stats["edge_too_low"] += 1
+            elif no_model_prob < self._min_side_probability:
+                logger.info(
+                    "[SKIP_NO] Model prob too low | model_p=%.4f (NO) "
+                    "min_side_prob=%.4f | need +%.4f higher",
+                    no_model_prob,
+                    self._min_side_probability,
+                    self._min_side_probability - no_model_prob,
+                )
+                self._filter_stats["prob_too_low"] += 1
+            elif not self._passes_order_book_filters(
+                market,
+                "BUY_NO",
+                no_book_snapshot,
+                log_details=True,
+            ):
+                pass  # Logging and tracking already handled in _passes_order_book_filters
+            else:
+                limit_price = self._compute_entry_price(
+                    no_bid, no_ask, "BUY_NO"
+                )
+                if not self._passes_entry_price_filter(
                     market,
                     "BUY_NO",
-                    no_book_snapshot,
+                    limit_price,
                 ):
-                    limit_price = self._compute_entry_price(
-                        no_bid, no_ask, "BUY_NO"
+                    pass  # Logging and tracking already handled in _passes_entry_price_filter
+                else:
+                    size = self._resolve_signal_size(
+                        limit_price, model_prob=no_model_prob
                     )
-                    if self._passes_entry_price_filter(
-                        market,
-                        "BUY_NO",
+                    logger.info(
+                        "[SIGNAL] NO side accepted | model_p=%.4f (NO) no_ask=%.4f "
+                        "edge=%.4f min_edge=%.4f price=%.2f size=%.4f",
+                        no_model_prob,
+                        no_ask,
+                        no_edge,
+                        effective_edge,
                         limit_price,
-                    ):
-                        size = self._resolve_signal_size(
-                            limit_price, model_prob=no_model_prob
-                        )
-                        return TradingSignal(
-                            side="BUY_NO",
-                            token_id=market.no_token_id,
-                            price=limit_price,
-                            size=size,
-                            edge=no_edge,
-                            model_prob=no_model_prob,
-                            market_price=no_ask,
-                            timestamp=now,
-                        )
+                        size,
+                    )
+                    return TradingSignal(
+                        side="BUY_NO",
+                        token_id=market.no_token_id,
+                        price=limit_price,
+                        size=size,
+                        edge=no_edge,
+                        model_prob=no_model_prob,
+                        market_price=no_ask,
+                        timestamp=now,
+                    )
 
         return None
 
@@ -748,6 +885,7 @@ class OrderRouter:
         market: MarketInfo,
         side: str,
         snapshot: Optional[OrderBookSnapshot],
+        log_details: bool = False,
     ) -> bool:
         """Reject entries facing obvious order-book resistance.
 
@@ -768,13 +906,15 @@ class OrderRouter:
             # Low imbalance = ask-heavy book = sell pressure = bad for our buy
             if imbalance < self._min_order_book_imbalance:
                 logger.info(
-                    "Signal filtered by book imbalance | market=%s side=%s "
-                    "imbalance=%.4f min=%.4f",
+                    "[SKIP_%s] Order book imbalance too low | market=%s "
+                    "imbalance=%.4f min=%.4f | need +%.4f higher",
+                    side.split("_")[1],
                     market.slug or market.condition_id,
-                    side,
                     imbalance,
                     self._min_order_book_imbalance,
+                    self._min_order_book_imbalance - imbalance,
                 )
+                self._filter_stats["imbalance_too_low"] += 1
                 return False
 
         ask_wall_ratio = snapshot.ask_wall_ratio
@@ -783,13 +923,14 @@ class OrderRouter:
             and ask_wall_ratio > self._max_ask_wall_ratio
         ):
             logger.info(
-                "Signal filtered by ask wall | market=%s side=%s "
+                "[SKIP_%s] Ask wall resistance too high | market=%s "
                 "ask_wall_ratio=%.4f max=%.4f",
+                side.split("_")[1],
                 market.slug or market.condition_id,
-                side,
                 ask_wall_ratio,
                 self._max_ask_wall_ratio,
             )
+            self._filter_stats["ask_wall_too_high"] += 1
             return False
 
         return True
@@ -808,17 +949,29 @@ class OrderRouter:
             return True
 
         logger.info(
-            "Signal filtered by max entry price | market=%s side=%s "
-            "price=%.4f max_entry_price=%.4f",
+            "[SKIP_%s] Entry price too high | market=%s "
+            "price=%.4f max_entry_price=%.4f | need %.4f price reduction",
+            side.split("_")[1],
             market.slug or market.condition_id,
-            side,
             price,
             self._max_entry_price,
+            price - self._max_entry_price,
         )
+        self._filter_stats["entry_price_too_high"] += 1
         return False
 
     def _safe_get_order_book(self, token_id: str):
         """Fetch a raw order book snapshot when the client can provide one."""
+        # Try the ultra-fast WebSocket cache first
+        if self._pm_ws and token_id:
+            try:
+                book = self._pm_ws.get_book(token_id)
+                if book and (book.get("bids") or book.get("asks")):
+                    return book
+            except Exception as e:
+                logger.debug("WS book cache miss for %s: %s", token_id[:12], e)
+                
+        # Fallback to slow REST API polling
         get_order_book = getattr(self._client, "get_order_book", None)
         if not callable(get_order_book):
             return None

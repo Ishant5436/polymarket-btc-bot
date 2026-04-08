@@ -63,7 +63,12 @@ class FeaturePipeline:
             self._historical_bars = pd.DataFrame(columns=BAR_INPUT_COLUMNS)
             return
 
-        seeded = bars[list(BAR_INPUT_COLUMNS)].copy()
+        seeded = bars.copy()
+        for col in BAR_INPUT_COLUMNS:
+            if col not in seeded.columns:
+                seeded[col] = 0.0 if col.startswith("liq_") else np.nan
+
+        seeded = seeded[list(BAR_INPUT_COLUMNS)].copy()
         seeded = seeded.sort_values("open_time").drop_duplicates(
             subset=["open_time"],
             keep="last",
@@ -104,7 +109,10 @@ class FeaturePipeline:
 
     def _build_minute_bar_frame(self) -> pd.DataFrame:
         """Combine REST-seeded history with closed live minute bars."""
-        live_bars = aggregate_trades_to_1m_bars(self._state.get_trades())
+        live_bars = aggregate_trades_to_1m_bars(
+            self._state.get_trades(),
+            self._state.get_liquidations()
+        )
 
         if self._historical_bars.empty and live_bars.empty:
             return pd.DataFrame(columns=BAR_INPUT_COLUMNS)

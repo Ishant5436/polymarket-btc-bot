@@ -7,6 +7,7 @@ fast prediction.
 import logging
 import os
 import pickle
+from pathlib import Path
 from typing import Any, Optional
 
 import lightgbm as lgb
@@ -15,8 +16,11 @@ import numpy as np
 from config.settings import PATHS
 from src.utils.model_metadata import (
     DEFAULT_TARGET_HORIZON_MINUTES,
+    get_model_target_horizon_minutes,
+    infer_target_horizon_minutes_from_model_path,
     load_training_metadata,
-    resolve_target_horizon_minutes,
+    training_metadata_path_for_model,
+    uses_legacy_training_metadata,
 )
 
 logger = logging.getLogger(__name__)
@@ -66,17 +70,74 @@ class ModelInference:
         try:
             self._model = lgb.Booster(model_file=self._model_path)
             self._metadata = load_training_metadata(self._model_path)
-            self._target_horizon_minutes = resolve_target_horizon_minutes(
-                self._metadata
+            metadata_path = training_metadata_path_for_model(self._model_path)
+            metadata_horizon = self._metadata.get("target_horizon_minutes")
+            inferred_horizon = infer_target_horizon_minutes_from_model_path(
+                self._model_path,
+                default=0,
             )
+            self._target_horizon_minutes = get_model_target_horizon_minutes(
+                self._model_path,
+                default=DEFAULT_TARGET_HORIZON_MINUTES,
+            )
+            try:
+                parsed_metadata_horizon = int(metadata_horizon)
+            except (TypeError, ValueError):
+                parsed_metadata_horizon = 0
             n_features = self._model.num_feature()
             n_trees = self._model.num_trees()
+            model_feature_names = [str(name) for name in self._model.feature_name()]
+
+            if (
+                uses_legacy_training_metadata(self._model_path)
+                and inferred_horizon > 0
+                and parsed_metadata_horizon > 0
+                and parsed_metadata_horizon != inferred_horizon
+            ):
+                logger.warning(
+                    "Legacy shared metadata horizon mismatch | path=%s metadata=%sm "
+                    "filename=%sm metadata_path=%s",
+                    self._model_path,
+                    metadata_horizon,
+                    inferred_horizon,
+                    metadata_path,
+                )
+
+            metadata_feature_columns = self._metadata.get("feature_columns")
+            if not isinstance(metadata_feature_columns, list) or len(
+                metadata_feature_columns
+            ) != n_features:
+                if metadata_feature_columns:
+                    logger.warning(
+                        "Metadata feature_columns mismatch | path=%s metadata=%s "
+                        "booster=%s metadata_path=%s",
+                        self._model_path,
+                        len(metadata_feature_columns),
+                        n_features,
+                        metadata_path,
+                    )
+                if len(model_feature_names) == n_features:
+                    self._metadata["feature_columns"] = model_feature_names
+            self._metadata["target_horizon_minutes"] = self._target_horizon_minutes
+            self._metadata["model_file"] = os.path.basename(self._model_path)
 
             # Improvement 3: Load isotonic calibrator if available
-            calibrator_path = os.path.join(
+            calibrator_candidates = [
+                str(Path(self._model_path).with_suffix(".calibrator.pkl"))
+            ]
+            legacy_calibrator_path = os.path.join(
                 os.path.dirname(self._model_path), "calibrator.pkl"
             )
-            if os.path.exists(calibrator_path):
+            if os.path.basename(self._model_path) == PATHS.model_filename:
+                calibrator_candidates.append(legacy_calibrator_path)
+
+            calibrator_path = None
+            for candidate in calibrator_candidates:
+                if os.path.exists(candidate):
+                    calibrator_path = candidate
+                    break
+
+            if calibrator_path is not None:
                 try:
                     with open(calibrator_path, "rb") as f:
                         self._calibrator = pickle.load(f)
@@ -91,8 +152,8 @@ class ModelInference:
                     self._calibrator = None
             else:
                 logger.info(
-                    "No calibrator found at %s — using raw model probabilities",
-                    calibrator_path,
+                    "No model-specific calibrator found for %s — using raw model probabilities",
+                    self._model_path,
                 )
 
             logger.info(

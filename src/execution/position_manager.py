@@ -10,8 +10,13 @@ from typing import Optional
 from config.settings import TRADING
 from src.exchange.gamma_api import GammaAPIClient, MarketInfo
 from src.exchange.polymarket_client import OrderResult, PolymarketClient
-from src.execution.market_rules import derive_market_resolution_rule, is_position_favorable
+from src.execution.market_rules import (
+    derive_market_resolution_rule,
+    is_position_favorable,
+    settles_yes,
+)
 from src.execution.order_router import TradingSignal
+from src.utils.model_metadata import DEFAULT_TARGET_HORIZON_MINUTES
 from src.utils.state import RollingState
 
 logger = logging.getLogger(__name__)
@@ -29,6 +34,7 @@ class ManagedPosition:
     initial_size: float
     remaining_size: float
     end_date: str
+    market_interval_minutes: Optional[int]
     neg_risk: bool
     entry_timestamp: float
     take_profit_taken: bool = False
@@ -109,6 +115,7 @@ class PositionManager:
                 initial_size=signal.size,
                 remaining_size=signal.size,
                 end_date=market.end_date,
+                market_interval_minutes=market.market_interval_minutes,
                 neg_risk=market.neg_risk,
                 entry_timestamp=signal.timestamp,
             )
@@ -124,6 +131,7 @@ class PositionManager:
         existing.initial_size += signal.size
         existing.remaining_size = total_size
         existing.end_date = market.end_date
+        existing.market_interval_minutes = market.market_interval_minutes
         existing.neg_risk = market.neg_risk
 
     def evaluate_positions(self, state: RollingState) -> list[ExitExecution]:
@@ -133,6 +141,11 @@ class PositionManager:
 
         executions: list[ExitExecution] = []
         for position_key, position in list(self._positions.items()):
+            settlement = self._settle_expired_position(position_key, position, state)
+            if settlement is not None:
+                executions.append(settlement)
+                continue
+
             decision = self._choose_exit(position, state)
             if decision is None:
                 continue
@@ -193,6 +206,100 @@ class PositionManager:
             return decay_decision
 
         return None
+
+    def _settle_expired_position(
+        self,
+        position_key: str,
+        position: ManagedPosition,
+        state: RollingState,
+    ) -> Optional[ExitExecution]:
+        """
+        Resolve matured positions locally once the market end time has passed.
+
+        After Polymarket closes a recurring market, its order book can
+        disappear before wallet-level realized P&L is reflected everywhere.
+        Settling against the observed BTC tape prevents the bot from polling
+        dead token IDs and mirrors the market's binary payoff structure.
+        """
+        parsed_end_ts = GammaAPIClient._parse_iso_timestamp(position.end_date)
+        if parsed_end_ts is None:
+            return None
+        end_ts_ms = int(parsed_end_ts * 1000)
+        if state.latest_timestamp_ms < end_ts_ms:
+            return None
+
+        end_price = state.get_price_at_or_before(end_ts_ms)
+        if end_price is None:
+            return None
+
+        settlement_market = MarketInfo(
+            condition_id=position.condition_id,
+            question=position.market_question,
+            slug=position.market_slug,
+            yes_token_id="",
+            no_token_id="",
+            end_date=position.end_date,
+            neg_risk=position.neg_risk,
+            market_interval_minutes=position.market_interval_minutes,
+        )
+        rule = derive_market_resolution_rule(settlement_market)
+
+        start_price: Optional[float] = None
+        if rule.resolution_type == "move":
+            interval_minutes = position.market_interval_minutes or DEFAULT_TARGET_HORIZON_MINUTES
+            start_ts_ms = end_ts_ms - (max(1, int(interval_minutes)) * 60 * 1000)
+            start_price = state.get_price_at_or_before(start_ts_ms)
+            if start_price is None:
+                return None
+
+        yes_won = settles_yes(rule, end_price=end_price, start_price=start_price)
+        won = (
+            (position.side == "BUY_YES" and yes_won)
+            or (position.side == "BUY_NO" and not yes_won)
+        )
+        settlement_price = 1.0 if won else 0.0
+        exit_size = position.remaining_size
+        realized_pnl = (settlement_price - position.entry_price) * exit_size
+
+        raw_response = {
+            "settled_position": True,
+            "settlement_reason": "market_expired",
+            "resolution_type": rule.resolution_type,
+            "resolution_end_price": end_price,
+            "settlement_price": settlement_price,
+            "won": won,
+        }
+        if start_price is not None:
+            raw_response["resolution_start_price"] = start_price
+        if self._read_only_mode:
+            raw_response["dry_run"] = True
+
+        result = OrderResult(
+            success=True,
+            order_id=f"settled:{position.condition_id}",
+            raw_response=raw_response,
+        )
+
+        self._positions.pop(position_key, None)
+        logger.info(
+            "Position settled at market expiry | market=%s side=%s won=%s "
+            "settlement_price=%.2f size=%.4f pnl=%.4f",
+            position.market_slug,
+            position.side,
+            won,
+            settlement_price,
+            exit_size,
+            realized_pnl,
+        )
+        return ExitExecution(
+            position_key=position_key,
+            reason="market_settlement",
+            exit_price=settlement_price,
+            exit_size=exit_size,
+            realized_pnl=realized_pnl,
+            remaining_size=0.0,
+            result=result,
+        )
 
     def _time_decay_exit(
         self,

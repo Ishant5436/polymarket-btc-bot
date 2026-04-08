@@ -39,6 +39,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config.settings import PATHS
 from src.features.schema import FEATURE_COLUMNS, TARGET_COLUMN, TIMESTAMP_COLUMN
 from src.utils.experiment_tracking import ExperimentTracker
+from src.utils.model_metadata import canonical_training_metadata_path_for_model
 
 
 
@@ -418,7 +419,7 @@ def save_model(
     trained_at = datetime.now(timezone.utc).isoformat()
 
     # Save primary model
-    model_path = PATHS.model_path
+    model_path = os.path.join(PATHS.models_dir, f"lgbm_btc_{target_horizon_minutes}m.txt")
     model.save_model(model_path)
     print(f"[✓] Model saved to {model_path}")
 
@@ -431,13 +432,13 @@ def save_model(
         print(f"[✓] Ensemble models saved to {ensemble_dir}/ ({len(ensemble_models)} models)")
 
     # Save isotonic calibrator
-    calibrator_path = os.path.join(PATHS.models_dir, "calibrator.pkl")
+    calibrator_path = os.path.splitext(model_path)[0] + ".calibrator.pkl"
     with open(calibrator_path, "wb") as f:
         pickle.dump(calibrator, f)
     print(f"[✓] Isotonic calibrator saved to {calibrator_path}")
 
     # Save metadata
-    meta_path = os.path.join(PATHS.models_dir, "training_metadata.json")
+    meta_path = canonical_training_metadata_path_for_model(model_path)
     cv_summary = ExperimentTracker.summarize_fold_metrics(metrics)
     metadata = {
         "trained_at": trained_at,
@@ -451,11 +452,19 @@ def save_model(
         "best_hyperparameters": best_params,
         "ensemble_info": ensemble_info,
         "dataset_summary": dataset_summary,
-        "model_file": PATHS.model_filename,
+        "model_file": os.path.basename(model_path),
     }
     with open(meta_path, "w") as f:
         json.dump(metadata, f, indent=2)
     print(f"[✓] Training metadata saved to {meta_path}")
+
+    if os.path.basename(model_path) == PATHS.model_filename:
+        legacy_calibrator_path = os.path.join(PATHS.models_dir, "calibrator.pkl")
+        with open(legacy_calibrator_path, "wb") as f:
+            pickle.dump(calibrator, f)
+        legacy_meta_path = os.path.join(PATHS.models_dir, "training_metadata.json")
+        with open(legacy_meta_path, "w") as f:
+            json.dump(metadata, f, indent=2)
 
     # Feature importance
     importance = model.feature_importance(importance_type="gain")
@@ -601,7 +610,7 @@ def main():
         parameters=training_parameters,
         context={
             "features_path": PATHS.features_path,
-            "model_output_path": PATHS.model_path,
+            "model_output_path": os.path.join(PATHS.models_dir, f"lgbm_btc_{args.target_horizon_minutes}m.txt"),
             "dataset_summary": dataset_summary,
         },
     )
@@ -624,7 +633,7 @@ def main():
             summary={
                 "cv_summary": ExperimentTracker.summarize_fold_metrics(metrics),
                 "rows": dataset_summary["rows"],
-                "model_path": PATHS.model_path,
+                "model_path": os.path.join(PATHS.models_dir, f"lgbm_btc_{args.target_horizon_minutes}m.txt"),
                 "target_horizon_minutes": args.target_horizon_minutes,
                 "best_hyperparameters": best_params,
                 "ensemble_seeds": seeds,

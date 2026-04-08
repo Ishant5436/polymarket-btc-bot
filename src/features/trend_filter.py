@@ -4,6 +4,9 @@ EMA trend confirmation filter.
 Improvement 2: Blocks entries that disagree with the short-term trend
 determined by EMA crossover. This cuts counter-trend losses by
 preventing the bot from fighting momentum.
+
+Uses 60-second sampled prices (minute-bar closes) instead of raw ticks
+to eliminate bid-ask bounce noise from the trend signal.
 """
 
 import logging
@@ -15,6 +18,9 @@ from src.utils.state import RollingState
 
 logger = logging.getLogger(__name__)
 
+# Resample raw ticks into 60-second close prices for trend detection
+_SAMPLE_INTERVAL_MS = 60_000
+
 
 class TrendFilter:
     """
@@ -23,6 +29,9 @@ class TrendFilter:
     Only allows entries when the trade direction agrees with the
     short-term trend. This prevents buying YES during downtrends
     and buying NO during uptrends.
+
+    Operates on 60-second sampled close prices to avoid noise from
+    sub-second bid-ask bounce in raw tick data.
     """
 
     def __init__(
@@ -44,9 +53,23 @@ class TrendFilter:
 
         Returns True (permissive) when insufficient data is available.
         """
-        prices = state.get_prices()
-        if len(prices) < self._min_prices:
+        # Fetch enough raw trades to cover slow_period minutes + buffer
+        lookback_seconds = (self._min_prices + 5) * 60
+        trades = state.get_window_by_time(lookback_seconds)
+        if len(trades) < 3:
             return True  # Not enough data — be permissive
+
+        # Down-sample raw ticks to 60-second interval closes
+        prices = RollingState._sample_prices_by_interval(
+            trades, _SAMPLE_INTERVAL_MS
+        )
+        if len(prices) < self._min_prices:
+            return True
+
+        # Only compute EMA on the tail we need (avoid O(100K) iteration)
+        tail_len = self._slow_period * 3
+        if len(prices) > tail_len:
+            prices = prices[-tail_len:]
 
         fast_ema = self._ema(prices, self._fast_period)
         slow_ema = self._ema(prices, self._slow_period)

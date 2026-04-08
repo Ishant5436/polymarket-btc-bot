@@ -24,6 +24,15 @@ class TradeRecord:
     trade_id: int = 0
 
 
+@dataclass
+class LiquidationRecord:
+    """A forced liquidation event from Binance Futures."""
+    side: str            # "BUY" or "SELL"
+    price: float
+    quantity: float
+    timestamp: int       # ms since epoch
+
+
 class RollingState:
     """
     High-performance rolling window of recent trades.
@@ -36,9 +45,11 @@ class RollingState:
             maxlen if maxlen is not None else FEATURES.rolling_state_maxlen
         )
         self._trades: deque[TradeRecord] = deque(maxlen=self._maxlen)
+        self._liquidations: deque[LiquidationRecord] = deque(maxlen=self._maxlen)
         self._lock = asyncio.Lock()
         self._last_price: float = 0.0
         self._trade_count: int = 0
+        self._liquidation_count: int = 0
 
     @property
     def size(self) -> int:
@@ -89,39 +100,68 @@ class RollingState:
         """Total trades received since initialization."""
         return self._trade_count
 
-    async def push_trade(self, trade_data: dict):
+    async def push_event(self, event_data: dict):
         """
-        Push a new trade into the rolling buffer.
-        
-        Args:
-            trade_data: Parsed trade dict from BinanceWebSocket with keys:
-                price, quantity, timestamp, is_buyer_maker, trade_id
+        Push a new trade or liquidation into the rolling buffer.
         """
-        record = TradeRecord(
-            price=trade_data["price"],
-            quantity=trade_data["quantity"],
-            timestamp=trade_data["timestamp"],
-            is_buyer_maker=trade_data["is_buyer_maker"],
-            trade_id=trade_data.get("trade_id", 0),
-        )
-
         async with self._lock:
+            if event_data.get("type") == "liquidation":
+                record = LiquidationRecord(
+                    side=event_data["side"],
+                    price=event_data["price"],
+                    quantity=event_data["quantity"],
+                    timestamp=event_data["timestamp"],
+                )
+                self._liquidations.append(record)
+                self._liquidation_count += 1
+            else:
+                record = TradeRecord(
+                    price=event_data["price"],
+                    quantity=event_data["quantity"],
+                    timestamp=event_data["timestamp"],
+                    is_buyer_maker=event_data["is_buyer_maker"],
+                    trade_id=event_data.get("trade_id", 0),
+                )
+                self._trades.append(record)
+                self._last_price = record.price
+                self._trade_count += 1
+
+    def push_event_sync(self, event_data: dict):
+        """Synchronous version for testing / non-async contexts."""
+        if event_data.get("type") == "liquidation":
+            record = LiquidationRecord(
+                side=event_data["side"],
+                price=event_data["price"],
+                quantity=event_data["quantity"],
+                timestamp=event_data["timestamp"],
+            )
+            self._liquidations.append(record)
+            self._liquidation_count += 1
+        else:
+            record = TradeRecord(
+                price=event_data["price"],
+                quantity=event_data["quantity"],
+                timestamp=event_data["timestamp"],
+                is_buyer_maker=event_data["is_buyer_maker"],
+                trade_id=event_data.get("trade_id", 0),
+            )
             self._trades.append(record)
             self._last_price = record.price
             self._trade_count += 1
 
-    def push_trade_sync(self, trade_data: dict):
-        """Synchronous version for testing / non-async contexts."""
-        record = TradeRecord(
-            price=trade_data["price"],
-            quantity=trade_data["quantity"],
-            timestamp=trade_data["timestamp"],
-            is_buyer_maker=trade_data["is_buyer_maker"],
-            trade_id=trade_data.get("trade_id", 0),
-        )
-        self._trades.append(record)
-        self._last_price = record.price
-        self._trade_count += 1
+    def push_trade_sync(self, event_data: dict):
+        """Compatibility wrapper for tests that push plain trade payloads."""
+        self.push_event_sync(event_data)
+
+    def push_liquidation_sync(self, event_data: dict):
+        """Compatibility wrapper for tests that push liquidation payloads."""
+        liquidation_event = dict(event_data)
+        liquidation_event["type"] = "liquidation"
+        self.push_event_sync(liquidation_event)
+
+    def get_liquidations(self) -> list[LiquidationRecord]:
+        """Get all buffered liquidations."""
+        return list(self._liquidations)
 
     def get_prices(self, n: Optional[int] = None) -> np.ndarray:
         """Get array of recent prices (most recent last)."""
@@ -193,20 +233,57 @@ class RollingState:
                 return trade.price
         return None
 
+    @staticmethod
+    def _sample_prices_by_interval(
+        trades: list[TradeRecord],
+        sample_interval_ms: int,
+    ) -> np.ndarray:
+        """
+        Collapse raw trades into interval-close prices.
+
+        Using the last trade in each interval makes volatility estimates less
+        sensitive to intra-second bid/ask bounce while still reacting to actual
+        directional moves in the underlying tape.
+        """
+        if sample_interval_ms <= 0:
+            return np.array([trade.price for trade in trades], dtype=np.float64)
+
+        sampled_prices: list[float] = []
+        current_bucket: Optional[int] = None
+
+        for trade in trades:
+            bucket = trade.timestamp // sample_interval_ms
+            if bucket != current_bucket:
+                sampled_prices.append(trade.price)
+                current_bucket = bucket
+            else:
+                sampled_prices[-1] = trade.price
+
+        return np.array(sampled_prices, dtype=np.float64)
+
     def get_volatility(self, window_seconds: int) -> float:
         """
-        Compute realized volatility (std of log returns) over a time window.
+        Compute realized volatility over a time window using 1-second closes.
+
+        The risk layer cares about regime shifts in BTC, not raw tick-by-tick
+        microstructure bounce. Sampling the last trade per second provides a
+        more stable realized-vol estimate for live kill-switch decisions.
         """
         trades = self.get_window_by_time(window_seconds)
         if len(trades) < 3:
             return 0.0
 
-        prices = np.array([t.price for t in trades], dtype=np.float64)
+        prices = self._sample_prices_by_interval(trades, sample_interval_ms=1000)
+        if len(prices) < 3:
+            return 0.0
+
         log_rets = np.log(prices[1:] / prices[:-1])
         return float(np.std(log_rets)) if len(log_rets) > 0 else 0.0
 
     def clear(self):
-        """Clear all trade data."""
+        """Clear all trade and liquidation data."""
         self._trades.clear()
+        self._liquidations.clear()
         self._last_price = 0.0
         self._trade_count = 0
+        self._liquidation_count = 0

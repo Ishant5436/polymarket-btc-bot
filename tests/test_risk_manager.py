@@ -11,6 +11,26 @@ from src.execution.risk_manager import RiskManager
 from src.utils.state import RollingState
 
 
+class _SequencedVolatilityState:
+    def __init__(self, vol_samples):
+        self._vol_samples = list(vol_samples)
+        self._index = -1
+        self._current_vol = 0.0
+        self._latest_timestamp_ms = 0
+
+    @property
+    def latest_timestamp_ms(self) -> int:
+        return self._latest_timestamp_ms
+
+    def advance(self):
+        self._index += 1
+        self._current_vol = self._vol_samples[self._index]
+        self._latest_timestamp_ms += 1000
+
+    def get_volatility(self, window_seconds: int) -> float:
+        return self._current_vol
+
+
 @pytest.fixture
 def state():
     """Create a RollingState with some trade data."""
@@ -224,3 +244,126 @@ class TestRiskManager:
         risk_manager.check_volatility()
 
         assert len(risk_manager._vol_history) == history_len
+
+    def test_check_volatility_ignores_intra_second_microstructure_bounce(
+        self, mock_client
+    ):
+        """
+        The live kill-switch should react to second-level BTC moves, not to
+        harmless tick-to-tick bounce within each second.
+        """
+        state = RollingState(maxlen=10_000)
+        risk_manager = RiskManager(
+            state=state,
+            client=mock_client,
+            sigma_threshold=3.0,
+            cooldown_seconds=5,
+            pnl_floor=-0.20,
+            max_positions=3,
+        )
+
+        base_time = int(time.time() * 1000)
+        trade_id = 0
+        triggered = False
+
+        for second in range(120):
+            close_price = 95_000 + np.sin(second / 6.0) * 10
+            bounce = 8.0 if second < 90 else 11.0
+
+            for offset, price in (
+                (0, close_price + bounce),
+                (200, close_price - bounce),
+                (400, close_price + (bounce * 0.6)),
+                (800, close_price),
+            ):
+                state.push_trade_sync(
+                    {
+                        "price": float(price),
+                        "quantity": 0.001,
+                        "timestamp": base_time + (second * 1000) + offset,
+                        "is_buyer_maker": False,
+                        "trade_id": trade_id,
+                    }
+                )
+                trade_id += 1
+
+            triggered = risk_manager.check_volatility() or triggered
+
+        assert len(risk_manager._vol_history) >= 30
+        assert not triggered
+        assert risk_manager.kill_count == 0
+
+    def test_check_volatility_ignores_tiny_absolute_spike_even_if_zscore_is_high(
+        self, mock_client
+    ):
+        baseline = [1.0e-5 + ((i % 2) * 1.0e-7) for i in range(30)]
+        state = _SequencedVolatilityState(baseline + [3.1e-5])
+        risk_manager = RiskManager(
+            state=state,
+            client=mock_client,
+            sigma_threshold=3.0,
+            min_absolute_volatility=5.0e-5,
+            min_relative_volatility_multiplier=2.0,
+            cooldown_seconds=5,
+            pnl_floor=-0.20,
+            max_positions=3,
+        )
+
+        triggered = False
+        for _ in range(31):
+            state.advance()
+            triggered = risk_manager.check_volatility() or triggered
+
+        assert not triggered
+        assert risk_manager.kill_count == 0
+        mock_client.cancel_all_orders.assert_not_called()
+
+    def test_check_volatility_requires_relative_spike_not_just_zscore(
+        self, mock_client
+    ):
+        baseline = [1.0e-5 + ((i % 2) * 1.0e-7) for i in range(30)]
+        state = _SequencedVolatilityState(baseline + [4.2e-5])
+        risk_manager = RiskManager(
+            state=state,
+            client=mock_client,
+            sigma_threshold=3.0,
+            min_absolute_volatility=2.0e-5,
+            min_relative_volatility_multiplier=5.0,
+            cooldown_seconds=5,
+            pnl_floor=-0.20,
+            max_positions=3,
+        )
+
+        triggered = False
+        for _ in range(31):
+            state.advance()
+            triggered = risk_manager.check_volatility() or triggered
+
+        assert not triggered
+        assert risk_manager.kill_count == 0
+        mock_client.cancel_all_orders.assert_not_called()
+
+    def test_check_volatility_triggers_for_large_absolute_and_relative_spike(
+        self, mock_client
+    ):
+        baseline = [1.0e-5 + ((i % 2) * 1.0e-7) for i in range(30)]
+        state = _SequencedVolatilityState(baseline + [8.0e-5])
+        risk_manager = RiskManager(
+            state=state,
+            client=mock_client,
+            sigma_threshold=3.0,
+            min_absolute_volatility=5.0e-5,
+            min_relative_volatility_multiplier=4.0,
+            cooldown_seconds=5,
+            pnl_floor=-0.20,
+            max_positions=3,
+        )
+
+        triggered = False
+        for _ in range(31):
+            state.advance()
+            triggered = risk_manager.check_volatility() or triggered
+
+        assert triggered
+        assert risk_manager.kill_count == 1
+        mock_client.cancel_all_orders.assert_called_once()

@@ -1,7 +1,7 @@
 import json
 from types import SimpleNamespace
 
-from src.exchange.gamma_api import GammaAPIClient
+from src.exchange.gamma_api import GammaAPIClient, MarketInfo
 
 
 def test_extract_next_data_and_find_market_by_slug():
@@ -280,3 +280,72 @@ def test_fetch_market_from_event_slug_skips_page_fetch_during_backoff():
     assert second is not None
     assert calls["page"] == 1
     assert calls["api"] == 2
+
+
+def test_btc_updown_5m_event_slug_uses_window_start_timestamp():
+    assert GammaAPIClient._btc_updown_5m_event_slug(1775587500) == "btc-updown-5m-1775587500"
+
+
+def test_candidate_btc_updown_5m_start_times_center_on_current_window():
+    client = GammaAPIClient()
+
+    starts = client._candidate_btc_updown_5m_start_times(1775587968.0)
+
+    assert starts == [
+        1775587800,
+        1775587500,
+        1775588100,
+        1775587200,
+        1775588400,
+    ]
+
+
+def test_fetch_btc_updown_5m_market_prefers_window_containing_now():
+    client = GammaAPIClient()
+    now_ts = 1775587968.0
+
+    def fake_fetch(slug, market_interval_minutes=None):
+        start_ts = int(slug.rsplit("-", 1)[-1])
+        return MarketInfo(
+            condition_id=f"condition-{start_ts}",
+            question=f"Bitcoin Up or Down - window {start_ts}",
+            slug=slug,
+            yes_token_id=f"yes-{start_ts}",
+            no_token_id=f"no-{start_ts}",
+            end_date="2026-04-07T18:45:00Z" if start_ts == 1775587200 else
+            "2026-04-07T18:50:00Z" if start_ts == 1775587500 else
+            "2026-04-07T18:55:00Z" if start_ts == 1775587800 else
+            "2026-04-07T19:00:00Z" if start_ts == 1775588100 else
+            "2026-04-07T19:05:00Z",
+            market_interval_minutes=market_interval_minutes,
+        )
+
+    client._fetch_market_from_event_slug = fake_fetch
+
+    market = client._fetch_btc_updown_5m_market(now_ts=now_ts)
+
+    assert market is not None
+    assert market.slug == "btc-updown-5m-1775587800"
+    assert market.market_interval_minutes == 5
+
+
+def test_fetch_btc_5m_market_prefers_direct_updown_family_before_hourly_fallback():
+    client = GammaAPIClient()
+    sentinel = MarketInfo(
+        condition_id="0x5m",
+        question="Bitcoin Up or Down - April 7, 2:50PM-2:55PM ET",
+        slug="btc-updown-5m-1775587800",
+        yes_token_id="yes-token",
+        no_token_id="no-token",
+        end_date="2026-04-07T18:55:00Z",
+        market_interval_minutes=5,
+    )
+
+    client._fetch_btc_updown_5m_market = lambda: sentinel
+    client._search_markets = lambda _query: (_ for _ in ()).throw(AssertionError("search should not run"))
+    client._get_all_active_markets = lambda: (_ for _ in ()).throw(AssertionError("active market scan should not run"))
+    client._fetch_btc_hourly_market = lambda: (_ for _ in ()).throw(AssertionError("hourly fallback should not run"))
+
+    market = client._fetch_btc_5m_market()
+
+    assert market == sentinel

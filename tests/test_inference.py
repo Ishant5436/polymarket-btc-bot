@@ -53,6 +53,65 @@ class TestModelInference:
         assert inf.load()
         assert inf.target_horizon_minutes == 60
 
+    def test_load_model_prefers_model_specific_metadata_over_shared_metadata(
+        self, dummy_model_path
+    ):
+        shared_metadata_path = Path(dummy_model_path).with_name("training_metadata.json")
+        shared_metadata_path.write_text(
+            json.dumps({"target_horizon_minutes": 5}),
+            encoding="utf-8",
+        )
+        model_specific_metadata_path = Path(dummy_model_path).with_suffix(
+            ".metadata.json"
+        )
+        model_specific_metadata_path.write_text(
+            json.dumps({"target_horizon_minutes": 60}),
+            encoding="utf-8",
+        )
+
+        inf = ModelInference(model_path=dummy_model_path)
+
+        assert inf.load()
+        assert inf.target_horizon_minutes == 60
+
+    def test_load_model_uses_booster_feature_names_when_metadata_shape_mismatches(
+        self, dummy_model_path
+    ):
+        metadata_path = Path(dummy_model_path).with_name("training_metadata.json")
+        metadata_path.write_text(
+            json.dumps(
+                {
+                    "target_horizon_minutes": 5,
+                    "feature_columns": ["only_one_feature"],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        inf = ModelInference(model_path=dummy_model_path)
+
+        assert inf.load()
+        assert len(inf.metadata["feature_columns"]) == 20
+
+    def test_load_model_uses_filename_horizon_when_legacy_shared_metadata_mismatches(
+        self, dummy_model_path, tmp_path
+    ):
+        renamed_model_path = tmp_path / "lgbm_btc_60m.txt"
+        renamed_model_path.write_text(
+            Path(dummy_model_path).read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+        shared_metadata_path = tmp_path / "training_metadata.json"
+        shared_metadata_path.write_text(
+            json.dumps({"target_horizon_minutes": 5}),
+            encoding="utf-8",
+        )
+
+        inf = ModelInference(model_path=str(renamed_model_path))
+
+        assert inf.load()
+        assert inf.target_horizon_minutes == 60
+
     def test_load_nonexistent(self):
         inf = ModelInference(model_path="/nonexistent/path.txt")
         assert not inf.load()

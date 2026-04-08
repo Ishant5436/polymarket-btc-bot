@@ -69,6 +69,10 @@ def validate_runtime_configuration(
 
     if RISK.volatility_sigma_threshold <= 0:
         errors.append("VOLATILITY_SIGMA_THRESHOLD must be positive")
+    if RISK.volatility_min_absolute_threshold < 0:
+        errors.append("VOLATILITY_MIN_ABSOLUTE_THRESHOLD must be non-negative")
+    if RISK.volatility_min_relative_multiplier < 1:
+        errors.append("VOLATILITY_MIN_RELATIVE_MULTIPLIER must be at least 1")
     if RISK.kill_switch_cooldown_seconds < 0:
         errors.append("KILL_SWITCH_COOLDOWN_SECONDS must be non-negative")
     if RISK.private_check_cache_ttl_seconds < 0:
