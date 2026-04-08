@@ -740,17 +740,23 @@ class OrderRouter:
 
         # --- Check YES side ---
         if yes_ask is not None and yes_ask > 0:
-            # Improvement 1 + 5: dynamic edge scaling
-            effective_edge = self._compute_effective_min_edge(model_prob)
-            yes_edge = model_prob - yes_ask
+            # Compute the actual entry price FIRST — edge must be measured
+            # against where we'd actually enter, not the raw ask.
+            limit_price = self._compute_entry_price(
+                yes_bid, yes_ask, "BUY_YES"
+            )
+            yes_edge = model_prob - limit_price
+            effective_edge = self._min_edge
             
             # Gatekeeping: Log all YES-side filter rejections
             if yes_edge < effective_edge:
                 logger.info(
-                    "[SKIP_YES] Insufficient edge | model_p=%.4f yes_ask=%.4f "
-                    "edge=%.4f min_edge=%.4f | need +%.4f more",
+                    "[SKIP_YES] Insufficient edge | model_p=%.4f entry=%.4f "
+                    "(ask=%.4f bid=%s) edge=%.4f min_edge=%.4f | need +%.4f more",
                     model_prob,
+                    limit_price,
                     yes_ask,
+                    f"{yes_bid:.4f}" if yes_bid else "None",
                     yes_edge,
                     effective_edge,
                     effective_edge - yes_edge,
@@ -772,56 +778,57 @@ class OrderRouter:
                 log_details=True,
             ):
                 pass  # Logging and tracking already handled in _passes_order_book_filters
+            elif not self._passes_entry_price_filter(
+                market,
+                "BUY_YES",
+                limit_price,
+            ):
+                pass  # Logging and tracking already handled in _passes_entry_price_filter
             else:
-                # Improvement 7: bid-side entry for price improvement
-                limit_price = self._compute_entry_price(
-                    yes_bid, yes_ask, "BUY_YES"
+                # Improvement 6: Kelly sizing
+                size = self._resolve_signal_size(
+                    limit_price, model_prob=model_prob
                 )
-                if not self._passes_entry_price_filter(
-                    market,
-                    "BUY_YES",
+                logger.info(
+                    "[SIGNAL] YES side accepted | model_p=%.4f entry=%.4f "
+                    "(ask=%.4f bid=%s) edge=%.4f min_edge=%.4f size=%.4f",
+                    model_prob,
                     limit_price,
-                ):
-                    pass  # Logging and tracking already handled in _passes_entry_price_filter
-                else:
-                    # Improvement 6: Kelly sizing
-                    size = self._resolve_signal_size(
-                        limit_price, model_prob=model_prob
-                    )
-                    logger.info(
-                        "[SIGNAL] YES side accepted | model_p=%.4f yes_ask=%.4f "
-                        "edge=%.4f min_edge=%.4f price=%.2f size=%.4f",
-                        model_prob,
-                        yes_ask,
-                        yes_edge,
-                        effective_edge,
-                        limit_price,
-                        size,
-                    )
-                    return TradingSignal(
-                        side="BUY_YES",
-                        token_id=market.yes_token_id,
-                        price=limit_price,
-                        size=size,
-                        edge=yes_edge,
-                        model_prob=model_prob,
-                        market_price=yes_ask,
-                        timestamp=now,
-                    )
+                    yes_ask,
+                    f"{yes_bid:.4f}" if yes_bid else "None",
+                    yes_edge,
+                    effective_edge,
+                    size,
+                )
+                return TradingSignal(
+                    side="BUY_YES",
+                    token_id=market.yes_token_id,
+                    price=limit_price,
+                    size=size,
+                    edge=yes_edge,
+                    model_prob=model_prob,
+                    market_price=yes_ask,
+                    timestamp=now,
+                )
 
         # --- Check NO side ---
         no_model_prob = 1.0 - model_prob
         if no_ask is not None and no_ask > 0:
-            effective_edge = self._compute_effective_min_edge(no_model_prob)
-            no_edge = no_model_prob - no_ask
+            limit_price = self._compute_entry_price(
+                no_bid, no_ask, "BUY_NO"
+            )
+            no_edge = no_model_prob - limit_price
+            effective_edge = self._min_edge
             
             # Gatekeeping: Log all NO-side filter rejections
             if no_edge < effective_edge:
                 logger.info(
-                    "[SKIP_NO] Insufficient edge | model_p=%.4f (NO) no_ask=%.4f "
-                    "edge=%.4f min_edge=%.4f | need +%.4f more",
+                    "[SKIP_NO] Insufficient edge | model_p=%.4f (NO) entry=%.4f "
+                    "(ask=%.4f bid=%s) edge=%.4f min_edge=%.4f | need +%.4f more",
                     no_model_prob,
+                    limit_price,
                     no_ask,
+                    f"{no_bid:.4f}" if no_bid else "None",
                     no_edge,
                     effective_edge,
                     effective_edge - no_edge,
@@ -843,40 +850,37 @@ class OrderRouter:
                 log_details=True,
             ):
                 pass  # Logging and tracking already handled in _passes_order_book_filters
+            elif not self._passes_entry_price_filter(
+                market,
+                "BUY_NO",
+                limit_price,
+            ):
+                pass  # Logging and tracking already handled in _passes_entry_price_filter
             else:
-                limit_price = self._compute_entry_price(
-                    no_bid, no_ask, "BUY_NO"
+                size = self._resolve_signal_size(
+                    limit_price, model_prob=no_model_prob
                 )
-                if not self._passes_entry_price_filter(
-                    market,
-                    "BUY_NO",
+                logger.info(
+                    "[SIGNAL] NO side accepted | model_p=%.4f (NO) entry=%.4f "
+                    "(ask=%.4f bid=%s) edge=%.4f min_edge=%.4f size=%.4f",
+                    no_model_prob,
                     limit_price,
-                ):
-                    pass  # Logging and tracking already handled in _passes_entry_price_filter
-                else:
-                    size = self._resolve_signal_size(
-                        limit_price, model_prob=no_model_prob
-                    )
-                    logger.info(
-                        "[SIGNAL] NO side accepted | model_p=%.4f (NO) no_ask=%.4f "
-                        "edge=%.4f min_edge=%.4f price=%.2f size=%.4f",
-                        no_model_prob,
-                        no_ask,
-                        no_edge,
-                        effective_edge,
-                        limit_price,
-                        size,
-                    )
-                    return TradingSignal(
-                        side="BUY_NO",
-                        token_id=market.no_token_id,
-                        price=limit_price,
-                        size=size,
-                        edge=no_edge,
-                        model_prob=no_model_prob,
-                        market_price=no_ask,
-                        timestamp=now,
-                    )
+                    no_ask,
+                    f"{no_bid:.4f}" if no_bid else "None",
+                    no_edge,
+                    effective_edge,
+                    size,
+                )
+                return TradingSignal(
+                    side="BUY_NO",
+                    token_id=market.no_token_id,
+                    price=limit_price,
+                    size=size,
+                    edge=no_edge,
+                    model_prob=no_model_prob,
+                    market_price=no_ask,
+                    timestamp=now,
+                )
 
         return None
 
