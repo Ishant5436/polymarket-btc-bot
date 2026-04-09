@@ -172,6 +172,8 @@ journalctl -u polymarket_bot -f
 | Taker | ~1.56% (dynamic) |
 | Gas (Polygon) | **$0** (covered by Relayer) |
 
+https://github.com/user-attachments/assets/27dd02db-e4be-4ed3-9eda-855a5db22f2c
+
 ## License
 
 MIT
