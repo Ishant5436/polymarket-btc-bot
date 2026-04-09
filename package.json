@@ -1,0 +1,19 @@
+{
+  "name": "btc",
+  "version": "1.0.0",
+  "description": "ML-driven, gasless trading bot that exploits mispricings in Polymarket's 5-minute BTC resolution markets using LightGBM inference, real-time Binance price streams, and post-only maker execution on Polygon.",
+  "main": "index.js",
+  "directories": {
+    "test": "tests"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@solrouter/sdk": "^1.0.1",
+    "dotenv": "^17.4.1"
+  }
+}

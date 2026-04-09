@@ -1,5 +1,6 @@
 # Environment & Secrets
 .env
+node_modules/
 *.pem
 *.key
 
@@ -48,3 +49,6 @@ Thumbs.db
 # Logs
 *.log
 logs/
+
+# Node
+node_modules/

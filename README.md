@@ -1,3 +1,27 @@
+# Private Polymarket Research Agent (SolRouter Bounty)
+
+This repository contains a **privacy-first Polymarket trading bot** specifically built for the **SolRouter bounty**.
+
+## Why SolRouter?
+In highly competitive 5-minute resolution markets like the Polymarket BTC "Price Up/Down" contracts, alpha decay happens in seconds. Using public LLM endpoints or public RPCs risks **front-running and strategy leaking**. 
+
+By utilizing SolRouter and the private `gpt-oss-20b` models with encryption, this agent guarantees that our sentiment summaries, volume spike analysis, and liquidity sweep detections remain confidential, ensuring our strategy retains its edge without adversarial exploit.
+
+## Quick Start
+1. Add your SolRouter API key to the `.env` file:
+   ```bash
+   SOLROUTER_API_KEY=your_secure_key_here
+   ```
+2. Run the secure research agent:
+   ```bash
+   node agent.js
+   ```
+
+---
+
+*The contents below represent the pre-existing, underlying Python pipeline for LightGBM inference and execution on the Polygon network.*
+
+---
 # Polymarket BTC 5-Minute Market Trading Bot
 
 ML-driven, gasless trading bot that exploits mispricings in Polymarket's 5-minute BTC resolution markets using LightGBM inference, real-time Binance price streams, and post-only maker execution on Polygon.
